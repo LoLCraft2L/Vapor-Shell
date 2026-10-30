@@ -3734,7 +3734,7 @@ def main():
     _mutex = k32.CreateMutexW(None, False, "Vapor.SingleInstance")  # noqa: F841 (kept alive on purpose)
     if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         _fatal("Vapor is already running, or an old copy is stuck in the background.\n\n"
-               ("End 'Vapor.exe'" if FROZEN else "End 'pythonw.exe' / 'python.exe'") + " in Task Manager, then start it again.", 0)
+               + ("End 'Vapor.exe'" if FROZEN else "End 'pythonw.exe' / 'python.exe'") + " in Task Manager, then start it again.", 0)
 
     qInstallMessageHandler(qt_log)
     log.info("starting (python %s, appbar=%s)", sys.version.split()[0], USE_APPBAR)
