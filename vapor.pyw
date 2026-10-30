@@ -345,6 +345,39 @@ def fullscreen_check(hwnd, pw, ph, own_pid):
     return True
 
 
+OVERLAY_EXES = {"screenclippinghost.exe", "snippingtool.exe", "screensketch.exe"}   # screenshot overlays (Win+Shift+S, Snipping Tool)
+
+
+def overlay_fullscreen(own_pid, pw, ph):
+    """True while a screenshot overlay (Snipping Tool / Win+Shift+S) covers the whole screen. Those windows are never the
+        foreground window the normal fullscreen check looks at, so the bar stayed on top of the screenshot."""
+    found = []
+
+    @EnumProc
+    def cb(hwnd, _lp):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            r = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            if r.left > 0 or r.top > 0 or r.right < pw or r.bottom < ph:
+                return True
+            cloaked = wintypes.DWORD(0)
+            dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)     # DWMWA_CLOAKED
+            if cloaked.value:
+                return True
+            pid = pid_of(hwnd)
+            if pid != own_pid and os.path.basename(exe_of(pid) or "").lower() in OVERLAY_EXES:
+                found.append(hwnd)
+                return False
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(cb, 0)
+    return bool(found)
+
+
 def activate_window(hwnd):
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE
@@ -741,7 +774,7 @@ def tasks_loop(b):
             if sig != last_sig:
                 last_sig = sig
                 b.tasksIn.emit((wins, fg))
-            fs = bool(HIDE_ON_FULLSCREEN and fullscreen_check(fg, b.pw, b.ph, own))
+            fs = bool(HIDE_ON_FULLSCREEN and (fullscreen_check(fg, b.pw, b.ph, own) or overlay_fullscreen(own, b.pw, b.ph)))
             if fs != last_fs:
                 last_fs = fs
                 b.fsIn.emit(fs)
@@ -2958,6 +2991,31 @@ class Backend(QObject):
             self._bar_hwnd = find_bar_hwnd()
         return self._bar_hwnd
 
+    MENU_CLASSES = {"#32768", "Xaml_WindowedPopupClass", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland"}
+
+    def _menu_above(self, hw, own):
+        """True if something that must stay above the bar already sits above `hw`, so raising the bar would cover it:
+            - a visible context menu / flyout (tray icon right-click menus, classes in MENU_CLASSES), or
+            - one of Vapor's own full-screen overlays (the power menu), which is a separate window of this process
+              and used to count as 'a foreign window above the bar' that had to be raised over."""
+        try:
+            me = os.getpid()
+            above, n = user32.GetWindow(hw, 3), 0            # GW_HWNDPREV
+            while above and n < 100:
+                if above not in own and user32.IsWindowVisible(above):
+                    if class_of(above) in self.MENU_CLASSES:
+                        return True
+                    if pid_of(above) == me:
+                        r = wintypes.RECT()
+                        user32.GetWindowRect(above, ctypes.byref(r))
+                        if (r.right - r.left) >= self.pw and (r.bottom - r.top) >= self.ph:
+                            return True
+                above = user32.GetWindow(above, 3)
+                n += 1
+        except Exception:
+            pass
+        return False
+
     def _keep_on_top(self, force=False):
         """The bar and its popup are always-on-top windows, but other windows can take the top spot (Explorer's
                 taskbar, another always-on-top app, an overlay ...) and nothing put ours back, so a hovered popup could end up
@@ -2976,6 +3034,8 @@ class Backend(QObject):
                 hw = wins.get(title)
                 if not hw or not user32.IsWindow(hw) or not user32.IsWindowVisible(hw):
                     continue
+                if time.time() < getattr(self, "_menu_until", 0.0) or self._menu_above(hw, own):
+                    continue                           # a tray icon was just clicked / a menu or the power menu is up: leave it on top
                 need = force
                 if not need:
                     mine = wintypes.RECT()
@@ -2988,6 +3048,12 @@ class Backend(QObject):
                             if (r.right > r.left and r.bottom > r.top and r.left < mine.right and r.right > mine.left
                                     and r.top < mine.bottom and r.bottom > mine.top):
                                 need = True
+                                cls = class_of(above)
+                                seen = self.__dict__.setdefault("_cover_seen", set())
+                                if cls not in seen and len(seen) < 40:
+                                    seen.add(cls)
+                                    log.info("keep on top: raising %s over window class %r (%s)", title, cls,
+                                             os.path.basename(exe_of(pid_of(above)) or "?"))
                         above = user32.GetWindow(above, 3)
                         n += 1
                 if need:
@@ -3088,6 +3154,7 @@ class Backend(QObject):
     def trayClick(self, key, button):
         it = self._tray_items.get(key)
         if it:
+            self._menu_until = time.time() + 10.0          # its menu opens now: don't raise the bar over it meanwhile
             try:
                 tray_click(it, button)
             except Exception:

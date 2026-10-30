@@ -84,6 +84,46 @@ $LogoSmallText = @'
  +##%%%###*++ .**+         +.
 '@
 
+# colours sampled from Vapor.png: each digit below is a palette index for the character at the same spot in the art above
+$LogoPalette = @('244;235;250', '221;202;244', '208;173;245', '192;152;245', '190;158;215', '175;136;245', '178;119;247', '181;126;234', '164;111;245', '180;99;240', '167;122;215', '161;110;232', '149;98;236', '145;94;212', '146;106;178', '110;69;150')
+$LogoBigColors = @'
+                                                6bbdde
+                                            d6666f
+                                     7e    eb66
+                14         77   43335a7   b886b
+              111227       a9 222335566888be  999999
+             e12223e4        4234 77657e  ddd99dfd9
+                77    cccddee443337f   aa5aaa dddccccc888888
+                f  ccccc   42223a a5555555a ffdf      cdc888
+              9d  cccd   4222223333556bb              dc888
+              99  cc  1112422123355d8b              dc8888
+                ef   11 e32112555  b6bdbd  242   8d88888
+            77aae  41111111235555  dc8888     7d88888
+         7777a  11111122235555668 db8888b  8d88888
+      7677a   1012111233555bbbb8888888bdeb8888b
+    6667   d1002101233 dddbbbbb    8fb88888    e4
+  6667b  c70000001223a5bc      8db88888  44   f412
+b666b    20000001223335  b8db88888     22213    e
+6666b6   00000012  5adb888888         e222237a
+66666668bbbbbbb88688888 ddddf            33
+   666666666688       cccc               a
+'@
+$LogoSmallColors = @'
+                              666bd
+                        7a   b66
+          12      7a2233568bb8d9999
+        e122a7     4245765dffdb9edccc8
+          aa cccdf 223a555555afddcccc888
+         99 ccc 222223555bb         c888
+         de d 114321355b8    a2  fc888
+       77aae1111112555 d8888 44b8888
+    7777a111112355568b88888fb8888
+  666ad40111123ddbbb88bdb8888  42
+666d  200012235b bfb88888 d42  42
+66bde100001335b88888     e2223a
+ 666666688888 8dcd         77
+'@
+
 # ------------------------------------------------------------------ terminal setup
 $ESC = [char]27
 $script:tui = $false
@@ -108,29 +148,28 @@ try {
 
 $AREA = 6                                                   # lines of the live status area
 # pick the biggest logo that fits the window (it must not scroll, or the redraw would smear)
-$LogoText = ''
+$LogoText = ''; $ColorText = ''
 if ($script:tui) {
-    if ($winW -ge 64 -and $winH -ge 30)     { $LogoText = $LogoBigText }
-    elseif ($winW -ge 44 -and $winH -ge 24) { $LogoText = $LogoSmallText }
+    if ($winW -ge 64 -and $winH -ge 30)     { $LogoText = $LogoBigText; $ColorText = $LogoBigColors }
+    elseif ($winW -ge 44 -and $winH -ge 24) { $LogoText = $LogoSmallText; $ColorText = $LogoSmallColors }
     if ($winH -lt 14) { $script:tui = $false }
 }
-$Logo = @(); if ($LogoText) { $Logo = @($LogoText -split "`r?`n") }
+$Logo = @(); $LogoCol = @(); if ($LogoText) { $Logo = @($LogoText -split "`r?`n"); $LogoCol = @($ColorText -split "`r?`n") }
 $LogoH = $Logo.Count
 $LogoW = 0; foreach ($r in $Logo) { if ($r.Length -gt $LogoW) { $LogoW = $r.Length } }
 
 function Mix($a, $b, [double]$t) { [int]($a + ($b - $a) * $t) }
 
-# colour of every logo cell, worked out once (white-lavender at the comet head, purple towards the tail)
+# colour of every logo cell: taken from the palette sampled out of Vapor.png (white-lavender comet head, purple ring and tails)
+$palRGB = @(); foreach ($p in $LogoPalette) { $palRGB += ,@($p -split ';' | ForEach-Object { [int]$_ }) }
 $cellC = New-Object 'object[]' $LogoH
 for ($y = 0; $y -lt $LogoH; $y++) {
-    $row = $Logo[$y]; $arr = New-Object 'int[]' ($row.Length * 3)
+    $row = $Logo[$y]; $crow = $LogoCol[$y]; $arr = New-Object 'int[]' ($row.Length * 3)
     for ($x = 0; $x -lt $row.Length; $x++) {
-        $idx = " .:+*#%@".IndexOf($row[$x]); if ($idx -lt 0) { $idx = 0 }
-        $t = 0.55 * ($x / [double][Math]::Max(1, $LogoW)) + 0.45 * (1.0 - $y / [double][Math]::Max(1, $LogoH - 1))
-        $f = 0.62 + 0.38 * ($idx / 7.0)
-        $arr[$x*3]   = [int]((Mix 250 146 $t) * $f)
-        $arr[$x*3+1] = [int]((Mix 244 98 $t) * $f)
-        $arr[$x*3+2] = [int]((Mix 255 246 $t) * $f)
+        $pi = 0
+        if ($x -lt $crow.Length -and $crow[$x] -ne ' ') { $pi = [Convert]::ToInt32([string]$crow[$x], 16) }
+        $rgb = $palRGB[$pi]
+        $arr[$x*3] = $rgb[0]; $arr[$x*3+1] = $rgb[1]; $arr[$x*3+2] = $rgb[2]
     }
     $cellC[$y] = $arr
 }

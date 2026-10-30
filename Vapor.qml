@@ -82,14 +82,26 @@ Window {
     // after a click on a tray icon its app comes to the front (menu / window), which used to close the popup right away.
     // trayHold keeps the tray popup open for a bit after such a click, coming back with the mouse releases it.
     property bool trayHold: false
+    // true from the moment a mouse button goes down on a tray icon (bar or popup) until it is released, so the popup can't
+    // close during the first pixels of a press / drag, before trayDragging is even set. trayBusy = pressed or dragging.
+    property bool trayPressed: false
+    readonly property bool trayBusy: trayDragging || trayPressed
+    Timer { interval: 60000; running: bar.trayPressed; onTriggered: { bar.trayPressed = false; bar.trayDragging = false; closeDelay.restart() } }     // safety net if a release never arrives
+    // the chip the mouse is on right now ("" = none). HitPad reports "left chip A" 45 ms AFTER "entered chip B", so a
+    // plain close timer used to be restarted by the stale "left" and closed the popup while the mouse sat on chip B.
+    property string hoverChip: ""
+    property Item hoverChipItem: null
     function holdTray() { trayHold = true; trayHoldTimer.restart() }
     Timer { id: trayHoldTimer; interval: 10000; onTriggered: { bar.trayHold = false; closeDelay.restart() } }
-    onFgChanged: if (open && !powerHold && !(page === "tray" && trayHold)) page = ""
+    onFgChanged: if (open && !powerHold && !(page === "tray" && (trayHold || trayBusy))) page = ""
     onSlideOutChanged: if (slideOut) page = ""
     Connections {
         target: B
         function onFullscreenChanged() { if (B.fullscreen) bar.page = "" }
-        function onOutsideClick() { if (bar.page === "control" && !bar.powerHold) bar.page = "" }     // clicked outside the control center
+        function onOutsideClick() {
+            if (bar.page === "control" && !bar.powerHold) bar.page = ""     // clicked outside the control center
+            bar.sideOutside()                                                // ...and outside the side panel while a note is being edited
+        }
     }
     onPageChanged: { if (page !== "clock") { clockTyping = false; clockPage.cancelEdit() } else clockPage.resetToNow(); if (page === "control") sideWant = false; if (page !== "") lastPage = page; if (page !== "tray") { trayHold = false; trayHoldTimer.stop() } B.setControlOpen(page === "control") }
     onRevealChanged: syncClip()
@@ -112,8 +124,10 @@ Window {
     property real trayDragY: 0
     property int trayDropIndex: 0
     property real trayDropX: 0
+    property bool trayDragWasPinned: false
     readonly property bool trayOverBar: trayDragging && trayDragY < barH + 8
-    function beginTrayDrag(key, icon, fromBar) {
+    function beginTrayDrag(key, icon, fromBar, wasPinned) {
+        trayDragWasPinned = wasPinned === true
         trayDragKey = key
         trayDragIcon = icon
         trayDragFromBar = fromBar
@@ -133,10 +147,11 @@ Window {
     }
     function endTrayDrag() {
         if (!trayDragging) return
-        var key = trayDragKey, idx = trayDropIndex, over = trayOverBar, fromBar = trayDragFromBar
+        var key = trayDragKey, idx = trayDropIndex, over = trayOverBar, fromBar = trayDragFromBar, wasPinned = trayDragWasPinned
         trayDragging = false
+        trayPressed = false
         if (over) Qt.callLater(function () { B.trayMove(key, true, idx) })
-        else if (fromBar) Qt.callLater(function () { B.trayMove(key, false, -1) })     // dragged off the bar = unpin
+        else if (fromBar || wasPinned) Qt.callLater(function () { B.trayMove(key, false, -1) })     // a pinned icon dragged off the bar (from the bar or from the popup) = unpin
         closeDelay.restart()
     }
     onWidthChanged: Qt.callLater(syncClip)
@@ -605,7 +620,12 @@ Window {
     property string pendingName: ""
     property var pendingItem: null
     Timer { id: openDelay; interval: 90; onTriggered: if (bar.pendingItem) bar.showPage(bar.pendingName, bar.pendingItem) }
-    Timer { id: closeDelay; interval: 280; onTriggered: if (!panelHover.hovered && bar.page !== "control" && !bar.clockTyping && !bar.trayDragging && !bar.trayHold) bar.page = "" }
+    Timer { id: closeDelay; interval: 280; onTriggered: {
+        // the mouse is on a chip: never close. (and if the popup did get closed under it, bring it back, which is what
+        // used to leave the chip highlighted with no popup until you moved out and in again)
+        if (bar.hoverChip !== "" && bar.hoverChipItem) { bar.showPage(bar.hoverChip, bar.hoverChipItem); return }
+        if (!panelHover.hovered && bar.page !== "control" && !bar.clockTyping && !bar.trayBusy && !bar.trayHold) bar.page = ""
+    } }
 
     // the control center is click-to-open and stays open (hovering other chips never takes it over),
     // it closes on a second click or when you focus another window
@@ -619,16 +639,22 @@ Window {
 
     function showPage(name, item) {
         if (page === "control" && name !== "control") return
+        if (trayBusy && name !== "tray") return          // dragging a tray icon: hovering other chips must not swap the popup away
         if (page === name) return
         anchorX = item.mapToItem(null, item.width / 2, 0).x
         page = name
     }
     function chipHover(name, item, on) {
         if (on) {
+            hoverChip = name
+            hoverChipItem = item
             closeDelay.stop()
             if (open) showPage(name, item)      // sliding from one chip to another: switch straight away
             else { pendingName = name; pendingItem = item; openDelay.restart() }
         } else {
+            if (hoverChip !== name) return      // a late "left" from the chip we just came from: the mouse is already on another one
+            hoverChip = ""
+            hoverChipItem = null
             openDelay.stop()
             closeDelay.restart()
         }
@@ -1111,20 +1137,21 @@ Window {
                             property real sx: 0
                             property real sy: 0
                             property bool moved: false
-                            onPressed: (m) => { sx = m.x; sy = m.y; moved = false }
+                            onPressed: (m) => { sx = m.x; sy = m.y; moved = false; bar.trayPressed = true }
+                            Component.onDestruction: if (pressed) { bar.trayPressed = false; if (moved) bar.trayDragging = false }
                             onPositionChanged: (m) => {
                                 if (!(pressedButtons & Qt.LeftButton)) return
                                 if (!moved && Math.abs(m.x - sx) + Math.abs(m.y - sy) > 8) {
                                     moved = true
-                                    bar.beginTrayDrag(tb.trayKey, tb.iconUrl, true)
+                                    bar.beginTrayDrag(tb.trayKey, tb.iconUrl, true, true)
                                 }
                                 if (moved) {
                                     var p = tbMouse.mapToItem(null, m.x, m.y)
                                     bar.moveTrayDrag(p.x, p.y)
                                 }
                             }
-                            onReleased: if (moved) bar.endTrayDrag()
-                            onCanceled: { moved = false; bar.trayDragging = false }
+                            onReleased: { bar.trayPressed = false; if (moved) bar.endTrayDrag(); else closeDelay.restart() }
+                            onCanceled: { moved = false; bar.trayDragging = false; bar.trayPressed = false; closeDelay.restart() }
                             onClicked: (m) => {
                                 if (moved) return
                                 if (m.button === Qt.MiddleButton) B.trayTogglePin(tb.trayKey)
@@ -1520,13 +1547,14 @@ Window {
                                         if (containsMouse) trayPage.hoverTitle = tt.trayTitle
                                         else if (trayPage.hoverTitle === tt.trayTitle) trayPage.hoverTitle = ""
                                     }
-                                    onPressed: (m) => { sx = m.x; sy = m.y; moved = false }
+                                    onPressed: (m) => { sx = m.x; sy = m.y; moved = false; bar.trayPressed = true }
+                                    Component.onDestruction: if (pressed) { bar.trayPressed = false; if (moved) bar.trayDragging = false }
                                     onPositionChanged: (m) => {
                                         if (!(pressedButtons & Qt.LeftButton)) return
                                         if (!moved && Math.abs(m.x - sx) + Math.abs(m.y - sy) > 8) {
                                             moved = true
                                             trayPage.hoverTitle = ""
-                                            bar.beginTrayDrag(tt.trayKey, tt.iconUrl, false)
+                                            bar.beginTrayDrag(tt.trayKey, tt.iconUrl, false, tt.pinned)
                                         }
                                         if (moved) {
                                             var p = ttMouse.mapToItem(trayPage, m.x, m.y)       // for the ghost inside the popup
@@ -1536,8 +1564,8 @@ Window {
                                             bar.moveTrayDrag(bar.popX + g.x, bar.popY + g.y)
                                         }
                                     }
-                                    onReleased: if (moved) bar.endTrayDrag()
-                                    onCanceled: { moved = false; bar.trayDragging = false }
+                                    onReleased: { bar.trayPressed = false; if (moved) bar.endTrayDrag(); else closeDelay.restart() }
+                                    onCanceled: { moved = false; bar.trayDragging = false; bar.trayPressed = false; closeDelay.restart() }
                                     onClicked: (m) => {
                                         if (moved) return
                                         if (m.button === Qt.MiddleButton) { B.trayTogglePin(tt.trayKey); return }
@@ -1591,7 +1619,7 @@ Window {
                             y: trayPage.flowY + trayPage.flowH + 8
                             width: parent.width - 36
                             elide: Text.ElideRight
-                            text: trayPage.hoverTitle !== "" ? trayPage.hoverTitle : "Drag an icon up to the bar to pin it  \u00B7  click to open"
+                            text: trayPage.hoverTitle !== "" ? trayPage.hoverTitle : "Drag to pin or unpin  \u00B7  click to open"
                             color: bar.muted
                             font.family: bar.uiFont
                             font.pixelSize: 11
@@ -1981,7 +2009,7 @@ Window {
                                 border.color: Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, 0.8)
                                 Text {
                                     x: 12; y: 9
-                                    textFormat: Text.StyledText
+                                    textFormat: bar.noteFmt(bar.ringing)
                                     text: bar.noteHtml(bar.ringing)
                                     color: "white"
                                     font.family: bar.uiFont
@@ -2131,7 +2159,7 @@ Window {
                                                         y: 6
                                                         width: parent.width - 12 - 150
                                                         elide: Text.ElideRight
-                                                        textFormat: Text.StyledText
+                                                        textFormat: bar.noteFmt(arow.modelData.t)
                                                         text: arow.modelData.t && arow.modelData.t !== "" ? bar.noteHtml(arow.modelData.t) : "Reminder"
                                                         color: arow.modelData.on ? "white" : Qt.rgba(1, 1, 1, 0.45)
                                                         font.family: bar.uiFont
@@ -2254,6 +2282,7 @@ Window {
                                         font.family: bar.uiFont
                                         font.pixelSize: 12
                                         onTextEdited: clockPage.alText = text
+                                        Keys.onPressed: (e) => { if (sidePanel.autoClose(remInput, e)) { clockPage.alText = remInput.text; e.accepted = true } }
                                         onAccepted: clockPage.addReminder()
                                         onActiveFocusChanged: if (!activeFocus && clockPage.typingN === 0) bar.clockTyping = false
                                     }
@@ -2427,7 +2456,6 @@ Window {
     // window overlaps another one's glass outline.
     property bool sideWant: false          // mouse is on the edge handle or on the panel
     property bool sideTyping: false        // a notes box has the keyboard (the panel window then accepts focus)
-    property bool sideKeepWhenTyping: false   // true: the panel stays open while a notes box has the keyboard, even if the mouse left
     property string sideTab: "reminders"   // reminders | notes
     property real sideP: 0                 // 0 = tucked away, 1 = fully out
     readonly property bool sideShow: sideWant && shown && page !== "control" && !trayDragging
@@ -2457,9 +2485,13 @@ Window {
     onShownChanged: if (!shown) { sideWant = false; sideTyping = false; dockWant = false }
     NumberAnimation { id: sideAnim; target: bar; property: "sideP"; easing.type: Easing.BezierSpline }
     Timer { id: sideOpenDelay; interval: 110; onTriggered: bar.sideWant = true }
-    Timer { id: sideCloseDelay; interval: 320; onTriggered: if (!edgeR.handleHovered && !sidePanelHover.hovered && !(bar.sideKeepWhenTyping && bar.sideTyping)) bar.sideWant = false }
+    Timer { id: sideCloseDelay; interval: 60; onTriggered: if (!edgeR.handleHovered && !sidePanelHover.hovered && !sidePanel.composing) bar.sideWant = false }
     // panel folded away: the note editor closes with it (unsaved text is dropped) and "New note" has to be pressed again
     onSideWantChanged: if (!sideWant) { sidePanel.closeComposer(); sideTyping = false }
+    // a click / focus loss somewhere that isn't the panel or its edge handle: this is what closes the panel while a note is open
+    function sideOutside() {
+        if (sideWant && sidePanel.composing && !sidePanelHover.hovered && !edgeR.handleHovered) sideWant = false
+    }
     function sideHover(on) {
         if (on) { sideCloseDelay.stop(); if (!sideWant) sideOpenDelay.restart() }
         else { sideOpenDelay.stop(); sideCloseDelay.restart() }
@@ -2492,7 +2524,7 @@ Window {
     }
     // same text with the markup removed (for places that can't show styled text)
     function noteText(s) {
-        return String(s === undefined || s === null ? "" : s).replace(/\{\/?([a-zA-Z]*|#[0-9a-fA-F]{3,8})\}/g, "").replace(/\*+/g, "")
+        return String(s === undefined || s === null ? "" : s).replace(/\{\/?([a-zA-Z]*|#[0-9a-fA-F]{3,8})\}/g, "").replace(/\*+/g, "").replace(/~~/g, "")
     }
     // note text -> Qt styled text:  **bold**   *italic*   {red}coloured{/red}  ({/} also closes, names or {#ff8800} work)
     readonly property var noteColors: ({ red: "#ff6b7a", green: "#7be08f", blue: "#6bb8ff", yellow: "#ffd86b", orange: "#ffb86b", pink: "#ff8fd0",
@@ -2509,9 +2541,15 @@ Window {
             return "<font color=\"" + c + "\">"
         })
         while (open-- > 0) t += "</font>"
+        t = t.replace(/~~([\s\S]+?)~~/g, "<s>$1</s>")
         t = t.replace(/\*\*([\s\S]+?)\*\*/g, "<b>$1</b>")
         t = t.replace(/\*([^*\n]+?)\*/g, "<i>$1</i>")
         return t.replace(/\n/g, "<br>")
+    }
+    // Qt's StyledText has no reliable strike-through tag, so text that has ~~strike~~ in it is drawn as RichText
+    // (which does). everything else keeps the StyledText it always had (so elide still works)
+    function noteFmt(s) {
+        return /~~[\s\S]+?~~/.test(String(s === undefined || s === null ? "" : s)) ? Text.RichText : Text.StyledText
     }
 
     // ---- live preview inside the text box (like Discord) ----
@@ -2521,7 +2559,7 @@ Window {
     function liveHtml(s) {
         var dim = "#6f7590"
         function D(x) { return "<span style=\"color:" + dim + "\">" + x + "</span>" }
-        var t = String(s === undefined || s === null ? "" : s).replace(/[\u0001\u0002]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        var t = String(s === undefined || s === null ? "" : s).replace(/[\u0001-\u0003]/g, "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         var open = 0
         t = t.replace(/\{(\/?)([a-zA-Z]*|#[0-9a-fA-F]{3,8})\}/g, function (m, close, name) {
             if (close) { if (open > 0) { open--; return "</span>" + D(m) } return D(m) }
@@ -2531,9 +2569,10 @@ Window {
             return D(m) + "<span style=\"color:" + c + "\">"
         })
         while (open-- > 0) t += "</span>"
+        t = t.replace(/~~([\s\S]+?)~~/g, "\u0003<s>$1</s>\u0003")
         t = t.replace(/\*\*([\s\S]+?)\*\*/g, "\u0001<b>$1</b>\u0001")
         t = t.replace(/\*([^*\n]+?)\*/g, "\u0002<i>$1</i>\u0002")
-        t = t.replace(/\u0001/g, D("**")).replace(/\u0002/g, D("*"))
+        t = t.replace(/\u0001/g, D("**")).replace(/\u0002/g, D("*")).replace(/\u0003/g, D("~~"))
         return "<div style=\"white-space:pre-wrap\">" + t + "</div>"
     }
     // ---- a card that grows out of a screen edge ----
@@ -2627,6 +2666,10 @@ Window {
         visible: bar.sideP > 0.002 && bar.shown
         color: "transparent"
         flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | (bar.sideTyping ? 0 : Qt.WindowDoesNotAcceptFocus)
+        // while a note is being edited the panel ignores the mouse leaving; clicking somewhere else (the window
+        // loses the keyboard) is what closes it. the short timer skips the focus flicker when the window flags change
+        onActiveChanged: if (!active && sidePanel.composing) outsideClick.restart()
+        Timer { id: outsideClick; interval: 220; onTriggered: if (!sideWin.active) bar.sideOutside() }
         width: bar.sideW                         // its right edge sits right on the frame's inner edge
         height: bar.sideH + 2 * bar.flare        // + room for the two concave joins above and below the card
         x: B.screenX + B.screenW - bar.frameW - width
@@ -2667,6 +2710,21 @@ Window {
                     property bool composing: false         // title + text editor is open (the + button opens it)
                     property var focusTarget: null
 
+                    // VS Code style: typing the } of {red} (or {#ff8800}) also writes {/red} and leaves the cursor between them
+                    function autoClose(ed, e) {
+                        if (e.text !== "}" || ed.selectedText !== "") return false
+                        var pos = ed.cursorPosition
+                        var m = /\{([a-zA-Z]+|#[0-9a-fA-F]{3,8})$/.exec(ed.text.substring(0, pos))
+                        if (!m) return false
+                        var key = m[1]
+                        if (!(bar.noteColors.hasOwnProperty(key.toLowerCase()) || key.charAt(0) === "#")) return false
+                        var ins = "}{/" + key + "}"
+                        var room = (ed.maximumLength !== undefined ? ed.maximumLength : 1000000) - ed.length
+                        if (room < ins.length) return false
+                        ed.insert(pos, ins)
+                        ed.cursorPosition = pos + 1
+                        return true
+                    }
                     function focusInput(t) { bar.sideTyping = true; focusTarget = t; noteFocus.restart() }
                     function newNote() {
                         titleEdit.text = ""
@@ -2706,7 +2764,7 @@ Window {
                     Timer {
                         id: typingCheck
                         interval: 160
-                        onTriggered: if (!titleEdit.activeFocus && !noteEdit.activeFocus) { bar.sideTyping = false; sideCloseDelay.restart() }
+                        onTriggered: if (!titleEdit.activeFocus && !noteEdit.activeFocus) { bar.sideTyping = false; sideCloseDelay.restart(); if (composing) bar.sideOutside() }
                     }
 
                     MouseArea { anchors.fill: parent }
@@ -2819,7 +2877,7 @@ Window {
                                                 y: 8
                                                 width: parent.width - 12 - 150
                                                 elide: Text.ElideRight
-                                                textFormat: Text.StyledText
+                                                textFormat: bar.noteFmt(srow.modelData.t)
                                                 text: srow.modelData.t && srow.modelData.t !== "" ? bar.noteHtml(srow.modelData.t) : "Reminder"
                                                 color: srow.modelData.on ? "white" : Qt.rgba(1, 1, 1, 0.45)
                                                 font.family: bar.uiFont
@@ -2959,6 +3017,7 @@ Window {
                                         maximumLength: 60
                                         font.family: bar.uiFont
                                         font.pixelSize: 12
+                                        Keys.onPressed: (e) => { if (sidePanel.autoClose(titleEdit, e)) e.accepted = true }
                                         Keys.onReturnPressed: noteEdit.forceActiveFocus()
                                         Keys.onEnterPressed: noteEdit.forceActiveFocus()
                                         KeyNavigation.tab: noteEdit
@@ -2996,18 +3055,29 @@ Window {
                                         anchors.fill: parent
                                         anchors.margins: 10
                                         contentWidth: width
-                                        contentHeight: noteEdit.contentHeight
+                                        contentHeight: Math.max(noteEdit.contentHeight, liveNote.contentHeight)
                                         clip: true
                                         boundsBehavior: Flickable.StopAtBounds
+                                        function clampY() {
+                                            var m = Math.max(0, contentHeight - height)
+                                            if (contentY > m) contentY = m
+                                            if (contentY < 0) contentY = 0
+                                        }
                                         function ensureVisible(r) {
                                             if (contentY >= r.y) contentY = r.y
                                             else if (contentY + height <= r.y + r.height) contentY = r.y + r.height - height
+                                            clampY()
                                         }
+                                        // deleting a lot of text leaves the old scroll offset behind: the leftover text slides out of the box
+                                        // (still there, but you can't reach it). pull the view back whenever the text gets shorter
+                                        onContentHeightChanged: clampY()
+                                        onHeightChanged: clampY()
                                         // live preview: the styled copy of the text, right in the box
-                                        LiveText { src: noteEdit; width: noteEdit.width; wrapMode: Text.Wrap }
+                                        LiveText { id: liveNote; src: noteEdit; width: noteEdit.width; wrapMode: Text.Wrap }
                                         TextEdit {
                                             id: noteEdit
                                             width: noteFlick.width
+                                            height: Math.max(contentHeight, noteFlick.height)
                                             wrapMode: TextEdit.Wrap
                                             color: "transparent"
                                             selectedTextColor: "transparent"
@@ -3019,6 +3089,7 @@ Window {
                                             onCursorRectangleChanged: noteFlick.ensureVisible(cursorRectangle)
                                             onActiveFocusChanged: if (!activeFocus) typingCheck.restart()
                                             Keys.onPressed: (e) => {
+                                                if (sidePanel.autoClose(noteEdit, e)) { e.accepted = true; return }
                                                 if ((e.key === Qt.Key_Return || e.key === Qt.Key_Enter) && (e.modifiers & Qt.ControlModifier)) {
                                                     sidePanel.saveNote()
                                                     e.accepted = true
@@ -3078,10 +3149,13 @@ Window {
                                     font.pixelSize: 12
                                 }
                                 Flickable {
+                                    id: noteListFlick
                                     anchors.fill: parent
                                     contentWidth: width
                                     contentHeight: noteCol.height
                                     boundsBehavior: Flickable.StopAtBounds
+                                    onContentHeightChanged: { var m = Math.max(0, contentHeight - height); if (contentY > m) contentY = m }
+                                    onHeightChanged: { var m = Math.max(0, contentHeight - height); if (contentY > m) contentY = m }
                                     Column {
                                         id: noteCol
                                         width: parent.width
@@ -3118,7 +3192,7 @@ Window {
                                                         visible: nrow.title !== ""
                                                         width: parent.width
                                                         elide: Text.ElideRight
-                                                        textFormat: Text.StyledText
+                                                        textFormat: bar.noteFmt(nrow.title)
                                                         text: bar.noteHtml(nrow.title)
                                                         color: "white"
                                                         font.family: bar.uiFont
@@ -3130,7 +3204,7 @@ Window {
                                                         wrapMode: Text.Wrap
                                                         maximumLineCount: nrow.expanded ? 1000 : 4
                                                         elide: Text.ElideRight
-                                                        textFormat: Text.StyledText
+                                                        textFormat: bar.noteFmt(nrow.body)
                                                         text: bar.noteHtml(nrow.body)
                                                         color: "white"
                                                         font.family: bar.uiFont
@@ -3830,7 +3904,7 @@ Window {
                     x: 72; y: 14
                     width: parent.width - 72 - 16
                     elide: Text.ElideRight
-                    textFormat: Text.StyledText
+                    textFormat: bar.noteFmt(bar.ringTitle)
                     text: bar.noteHtml(bar.ringTitle)
                     color: "white"
                     font.family: bar.uiFont
