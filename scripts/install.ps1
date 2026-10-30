@@ -1,5 +1,4 @@
 # Vapor installer / updater / uninstaller (terminal UI).
-# Version: v0.1.0 - closed beta testing
 #   Install or update:  irm https://raw.githubusercontent.com/LoLCraft2L/Vapor-Shell/main/scripts/install.ps1 | iex
 # Options (needs the script-block form):
 #   & ([scriptblock]::Create((irm <that url>))) -AutoStart      start Vapor at every login
@@ -12,7 +11,7 @@ param(
     [switch]$AutoStart,
     [switch]$Uninstall
 )
-$VaporVersion = 'v0.1.0'
+$VaporVersion = 'v0.1.2'
 $VaporStage   = 'closed beta testing'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
