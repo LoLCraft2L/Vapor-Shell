@@ -1,28 +1,53 @@
-name: release
+name: Build and release
+
 on:
   push:
-    tags: ["v*"]          # git tag v1.0.0 && git push --tags
+    tags:
+      - "v*"
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build
+
+      - name: Install dependencies
         shell: pwsh
-        run: ./build.ps1
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: pyinstaller vapor.spec --noconfirm
+
+      - name: Zip the build
+        shell: pwsh
+        run: |
+          $name = "Vapor-${{ github.ref_name }}.zip"
+          Compress-Archive -Path dist\* -DestinationPath $name -Force
+          echo "ZIP_NAME=$name" >> $env:GITHUB_ENV
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vapor-build
+          path: ${{ env.ZIP_NAME }}
+
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Vapor-win64.zip
-      - uses: actions/upload-artifact@v4
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        with:
-          name: Vapor-win64
-          path: dist/Vapor-win64.zip
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
