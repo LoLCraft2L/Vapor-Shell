@@ -4,7 +4,7 @@
 
 <h1 align="center">Vapor</h1>
 
-<p align="center">A bar and control center for Windows.<br>Python + PySide6 + QML.</p>
+<p align="center">A linux like shell for Windows.<br>Python + PySide6 + QML.</p>
 
 <p align="center"><b>v0.1.0 &middot; closed beta testing</b></p>
 
