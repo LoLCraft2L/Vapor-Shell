@@ -17,7 +17,11 @@ import sys
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+FROZEN = bool(getattr(sys, "frozen", False))      # True when running as the PyInstaller vaporctl.exe
+if FROZEN:
+    HERE = Path(sys.executable).resolve().parent     # the install folder (next to Vapor.exe), NOT the _MEI temp folder
+else:
+    HERE = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("LOCALAPPDATA", str(HERE))) / "vapor"
 CLI_FILE = DATA / "cli.json"
 
@@ -105,9 +109,13 @@ def start_vapor():
     pid = _stale_pid()
     if pid:
         raise RuntimeError("a Vapor process (pid %d) is alive but not answering; try: vaporctl stop --force" % pid)
-    exe = Path(sys.executable)
-    pyw = exe.with_name("pythonw.exe")
-    subprocess.Popen([str(pyw if pyw.exists() else exe), str(HERE / "vapor.pyw")], cwd=str(HERE),
+    if FROZEN:      # sys.executable is vaporctl.exe here: start Vapor.exe from the same folder
+        cmd = [str(HERE / "Vapor.exe")]
+    else:
+        exe = Path(sys.executable)
+        pyw = exe.with_name("pythonw.exe")
+        cmd = [str(pyw if pyw.exists() else exe), str(HERE / "vapor.pyw")]
+    subprocess.Popen(cmd, cwd=str(HERE),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
                      creationflags=0x00000008 | 0x00000200 | 0x08000000)       # detached, own group, no window
     for _ in range(60):
