@@ -80,6 +80,15 @@ try:
         from PySide6.QtGui import QFileIconProvider
     except ImportError:  # older layouts
         from PySide6.QtWidgets import QFileIconProvider
+    try:                                         # for the taskbar-style window thumbnails (image://winthumb/<hwnd>)
+        from PySide6.QtQuick import QQuickImageProvider
+        try:
+            from PySide6.QtQml import QQmlImageProviderBase
+            _IMG_TYPE = QQmlImageProviderBase.ImageType.Image
+        except Exception:
+            _IMG_TYPE = QQuickImageProvider.ImageType.Image
+    except Exception:
+        QQuickImageProvider = None
 except Exception:
     _fatal("Could not load PySide6:\n\n" + traceback.format_exc()[-900:]
            + "\nFix:  py -m pip install pyside6")
@@ -104,12 +113,16 @@ STRIP_H = RESERVE_H + 20               # main window height in logical px: the b
 HIDE_HOTKEY = "alt+w"    # global hotkey to hide / show the bar, like "ctrl+alt+b" or "win+f2", "" turns it off
 HIDE_RELEASES_SPACE = True   # give the reserved space back while hidden
 HIDE_ON_FULLSCREEN = True
+HIDE_ON_SNIP = True      # hide the bar while the Snipping Tool / Win+Shift+S capture overlay is up (otherwise it stays on top of the dimmed screen)
+SNIP_EXES = ("screenclippinghost.exe", "snippingtool.exe")   # programs that draw the capture overlay
 CONTROL_CENTER = str(APPDIR / "control_center.exe") if FROZEN else str(HERE / "control_center.pyw")   # old stand-alone control center next to this file, only used by B.openControlCenter
 KOMOREBI_MONITOR = 0     # which komorebi monitor the workspace dots follow
 AUTO_SWITCH_OUTPUT = True  # make a playback device the default as soon as it shows up (headphones, Bluetooth, USB DAC ...)
 VIZ_RANGE_DB = 38.0     # how many dB under the loudest band still show (lower = more contrast, higher = flatter)
 OUTLINE_MAX_SAT = 0.62    # max saturation of the wallpaper outline / icon colour (1.0 = neon, 0.5 = soft pastel)
 FILL_DARKNESS = 0.8    # shell brightness: 1.0 = original, 0.6 = clearly darker, 0.4 = very dark (outline isn't affected)
+LOCK_DARK_VARIANT = True   # the shell always uses the dark variant's brightness (the one a saved glass colour from the control center gives at start) and takes only hue / saturation from the wallpaper
+FILL_MAX_V = 0.11      # hard ceiling for the shell fill's brightness (HSV value). a bright wallpaper can never make the shell lighter than this
 VIZ_FALL = 0.82         # how fast the bars fall each frame (0.7 = snappy, 0.9 = floaty)
 WIFI_POLL_S = 60         # backup re-check of the network name, every check starts a PowerShell process. normally it's re-checked as soon as Windows reports a change
 PHONES_POLL_S = 2        # how often the playback devices' registry fingerprint is checked (cheap, no process). the PowerShell scan only runs when it changes
@@ -345,37 +358,123 @@ def fullscreen_check(hwnd, pw, ph, own_pid):
     return True
 
 
-OVERLAY_EXES = {"screenclippinghost.exe", "snippingtool.exe", "screensketch.exe"}   # screenshot overlays (Win+Shift+S, Snipping Tool)
+def is_snip_overlay(hwnd, pw, ph):
+    """True if `hwnd` is a visible, monitor-sized window of the screenshot tool (the dimmed capture overlay).
+        Its window class is often Windows.UI.Core.CoreWindow, which fullscreen_check() deliberately skips, and the
+        overlay isn't always the foreground window, so it gets its own check. A normal Snipping Tool window is
+        never monitor-sized, so it doesn't count."""
+    try:
+        if not user32.IsWindowVisible(hwnd):
+            return False
+        if os.path.basename(exe_of(pid_of(hwnd))).lower() not in SNIP_EXES:
+            return False
+        cloaked = wintypes.DWORD(0)
+        dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)   # DWMWA_CLOAKED
+        if cloaked.value:
+            return False
+        r = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        return r.left <= 0 and r.top <= 0 and r.right >= pw and r.bottom >= ph
+    except Exception:
+        return False
 
 
-def overlay_fullscreen(own_pid, pw, ph):
-    """True while a screenshot overlay (Snipping Tool / Win+Shift+S) covers the whole screen. Those windows are never the
-        foreground window the normal fullscreen check looks at, so the bar stayed on top of the screenshot."""
-    found = []
+def snip_overlay_active(pw, ph, own_pid):
+    found = [False]
 
     @EnumProc
     def cb(hwnd, _lp):
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            r = wintypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(r))
-            if r.left > 0 or r.top > 0 or r.right < pw or r.bottom < ph:
-                return True
-            cloaked = wintypes.DWORD(0)
-            dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), 4)     # DWMWA_CLOAKED
-            if cloaked.value:
-                return True
-            pid = pid_of(hwnd)
-            if pid != own_pid and os.path.basename(exe_of(pid) or "").lower() in OVERLAY_EXES:
-                found.append(hwnd)
-                return False
-        except Exception:
-            pass
+        if pid_of(hwnd) != own_pid and is_snip_overlay(hwnd, pw, ph):
+            found[0] = True
+            return False
         return True
 
     user32.EnumWindows(cb, 0)
-    return bool(found)
+    return found[0]
+
+
+# ---- RAM / GPU memory for the dashboard tiles (only read while the dashboard is showing) ----
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+
+GPU_PS = (
+    r"$ErrorActionPreference='SilentlyContinue'; "
+    r"$u = 0; (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage').CounterSamples | ForEach-Object { $u += $_.CookedValue }; "
+    r"$t = 0; Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' | ForEach-Object { "
+    r"$p = Get-ItemProperty $_.PSPath; $v = $p.'HardwareInformation.qwMemorySize'; "
+    r"if ($v -is [byte[]]) { $v = [BitConverter]::ToUInt64($v, 0) }; if ($v) { $t += [double]$v } }; "
+    r"[string]$u + '|' + [string]$t"
+)
+_gpu_nvidia = {"ok": True}
+
+
+def gpu_memory():
+    """(used GB, total GB, name) added up over every GPU, or None. nvidia-smi when there is one, otherwise Windows' own
+        GPU counters (any vendor, slower)."""
+    if _gpu_nvidia["ok"]:
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            for c in (r"C:\Windows\System32\nvidia-smi.exe", r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"):
+                if os.path.exists(c):
+                    exe = c
+                    break
+        try:
+            out = run_hidden([exe, "--query-gpu=name,memory.used,memory.total", "--format=csv,noheader,nounits"], timeout=4) if exe else ""
+            used = total = 0.0
+            names = []
+            for line in out.strip().splitlines():
+                part = [x.strip() for x in line.split(",")]
+                if len(part) >= 3:
+                    names.append(part[0])
+                    used += float(part[1])
+                    total += float(part[2])
+            if total > 0:
+                return used / 1024.0, total / 1024.0, " + ".join(names)
+        except Exception:
+            pass
+        _gpu_nvidia["ok"] = False          # no NVIDIA card: don't try again every second
+    try:
+        out = run_hidden(["powershell", "-NoProfile", "-NonInteractive", "-Command", GPU_PS], timeout=12).strip()
+        u, t = out.split("|")[:2]
+        u, t = float(u), float(t)
+        if t > 0:
+            return u / 1073741824.0, t / 1073741824.0, ""
+    except Exception:
+        pass
+    return None
+
+
+def ram_loop(b):
+    m = MEMORYSTATUSEX()
+    m.dwLength = ctypes.sizeof(m)
+    while True:
+        b._stats_ev.wait()                 # only while the dashboard is showing
+        try:
+            if kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                b.statsIn.emit({"ramUsed": round((m.ullTotalPhys - m.ullAvailPhys) / 1073741824.0, 2),
+                                "ramTotal": round(m.ullTotalPhys / 1073741824.0, 2)})
+        except Exception:
+            log.exception("ram")
+        time.sleep(0.5)
+
+
+def gpu_loop(b):
+    while True:
+        b._stats_ev.wait()
+        try:
+            g = gpu_memory()
+            if g:
+                b.statsIn.emit({"gpuUsed": round(g[0], 2), "gpuTotal": round(g[1], 2), "gpuName": g[2], "gpuState": "ok"})
+            else:
+                b.statsIn.emit({"gpuState": "none"})
+        except Exception:
+            log.exception("gpu")
+        time.sleep(1.0)
 
 
 def activate_window(hwnd):
@@ -522,7 +621,10 @@ def wallpaper_colors(src):
         oh, os_ = h, s
     # a wallpaper with real colour gets a strongly saturated outline, a grey one stays grey (no hue to boost)
     o_sat = min(OUTLINE_MAX_SAT, max(os_ * 0.9, 0.4)) if os_ >= 0.12 else os_
-    return argb(1.0, h, min(0.85, s * 1.1), (0.12 + 0.18 * v) * FILL_DARKNESS), argb(1.0, oh, o_sat, 1.0)
+    # the fill used to get brighter with the wallpaper (value 0.10 .. 0.24), so bright wallpapers gave a lighter shell.
+    # now it's capped, so every wallpaper gets the same dark shell, only the hue / saturation follow the wallpaper
+    fill_v = min((0.12 + 0.18 * v) * FILL_DARKNESS, FILL_MAX_V)
+    return argb(1.0, h, min(0.85, s * 1.1), fill_v), argb(1.0, oh, o_sat, 1.0)
 
 
 HINT_FILE = DATA / "wallpaper_next.txt"     # Harmony writes the new wallpaper's path here as soon as a change starts
@@ -548,6 +650,7 @@ def glass_loop(b):
                 hp = HINT_FILE.read_text(encoding="utf-8", errors="ignore").strip()
                 if hp and os.path.exists(hp):
                     fill, outline = wallpaper_colors(hp)
+                    log.info("colours from hint %s: fill %s outline %s", hp, fill, outline)
                     b.glassIn.emit((fill, outline))
                     hinted_until = time.time() + 8       # Windows' own copy shows up a moment later, don't recolour twice
             # 2) otherwise follow the wallpaper Windows is showing (about every 1.5 s)
@@ -556,12 +659,15 @@ def glass_loop(b):
                 src = path if path and os.path.exists(path) else str(transcoded)
                 sig = (src, os.path.getmtime(src) if os.path.exists(src) else 0,
                        os.path.getmtime(transcoded) if transcoded.exists() else 0)
-                if sig != last and os.path.exists(src):
+                if sig != last and os.path.exists(src) and time.time() >= hinted_until:
+                    # only mark it done once we've really coloured from it. before, a change seen during the 8 s
+                    # after a hint was dropped for good, so the hint's colours stayed until the next restart, and
+                    # a restart (which colours from Windows' copy) then looked "way different"
                     last = sig
-                    if time.time() >= hinted_until:
-                        fill, outline = wallpaper_colors(src)
-                        b.glassIn.emit((fill, outline))
-                        trim_memory()
+                    fill, outline = wallpaper_colors(src)
+                    log.info("colours from windows wallpaper %s: fill %s outline %s", src, fill, outline)
+                    b.glassIn.emit((fill, outline))
+                    trim_memory()
         except Exception:
             log.exception("glass")
         tick += 1
@@ -774,7 +880,9 @@ def tasks_loop(b):
             if sig != last_sig:
                 last_sig = sig
                 b.tasksIn.emit((wins, fg))
-            fs = bool(HIDE_ON_FULLSCREEN and (fullscreen_check(fg, b.pw, b.ph, own) or overlay_fullscreen(own, b.pw, b.ph)))
+            fs = bool(HIDE_ON_FULLSCREEN and fullscreen_check(fg, b.pw, b.ph, own))
+            if not fs and HIDE_ON_SNIP:
+                fs = snip_overlay_active(b.pw, b.ph, own)
             if fs != last_fs:
                 last_fs = fs
                 b.fsIn.emit(fs)
@@ -1003,6 +1111,33 @@ def load_config():
     return out
 
 
+def ensure_cli_shim():
+    """Typing `vaporctl` in a terminal only finds vaporctl.exe / .cmd / .bat: a bare vaporctl.py is not on PATHEXT, so
+        having the folder on Path isn't enough. If the folder only has vaporctl.py this writes a small vaporctl.cmd
+        next to it that runs it with this Python. A vaporctl.cmd you made yourself is never touched."""
+    if FROZEN:
+        return                                                  # the packaged build ships vaporctl.exe
+    src = APPDIR / "vaporctl.py"
+    if not src.is_file() or (APPDIR / "vaporctl.exe").exists() or (APPDIR / "vaporctl.bat").exists():
+        return
+    py = Path(sys.executable)
+    if py.name.lower() == "pythonw.exe" and (py.parent / "python.exe").exists():
+        py = py.parent / "python.exe"                           # a console program has to run under python.exe
+    marker = "@rem vapor-shim (written by Vapor, safe to delete)"
+    want = marker + '\r\n@echo off\r\n"%s" "%%~dp0vaporctl.py" %%*\r\n' % py
+    shim = APPDIR / "vaporctl.cmd"
+    try:
+        if shim.exists():
+            cur = shim.read_text(encoding="utf-8")
+            if cur == want or not cur.startswith(marker):
+                return
+        with open(shim, "w", encoding="utf-8", newline="") as f:
+            f.write(want)
+        log.info("cli: wrote %s", shim)
+    except OSError:
+        log.exception("cli: could not write vaporctl.cmd")
+
+
 def ensure_on_path():
     """Keeps this folder on your user Path (HKCU, no admin) so `vaporctl` works from any terminal. If the folder moved,
         the entry Vapor added earlier gets replaced. Terminals that were already open need reopening to see it.
@@ -1029,6 +1164,7 @@ def ensure_on_path():
         if not any(norm(e) == norm(here) for e in keep):
             keep.append(here)
         if keep == entries:
+            log.info("path: %s already on the user Path", here)
             return
         winreg.SetValueEx(k, "Path", 0, typ, ";".join(keep))
     try:
@@ -1165,6 +1301,59 @@ def _media_api():
     return api
 
 
+# seconds to wait between the cover re-checks after a track changes: apps often swap the cover a moment AFTER the title
+ART_RECHECK = (0.7, 1.5, 3.0, 5.0, 8.0)
+
+
+class _PosClock:
+    """Keeps the track position ticking smoothly between the updates an app sends (Spotify and browsers only report
+    on play / pause / seek, not every second).
+
+        The old code re-based its clock only when the reported position changed, so after a pause, a new track that
+        started at 0:00 again, or a widget started in the middle of a song, the bar jumped ahead or sat still. This one
+        re-bases on every change of position OR play state, and starts from what the app reported + how long ago it
+        reported it."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.sig = None
+        self.base = 0.0
+        self.t0 = time.time()
+
+    def now(self, pos, playing, age):
+        """pos: seconds as last reported. age: seconds since the app reported it (None = unknown)."""
+        sig = (round(pos, 2), bool(playing))
+        if sig != self.sig:
+            self.sig = sig
+            self.base = pos + (age if (playing and age is not None) else 0.0)
+            self.t0 = time.time()
+        return self.base + ((time.time() - self.t0) if playing else 0.0)
+
+
+def _tl_read(tl, playing):
+    """(length, position, age) in seconds from a GSMTC timeline. length 0 = the app gave no usable length (live stream ...).
+    position is counted from the timeline's own start (it is not always 0). age = how long ago the app reported it."""
+    start = tl.start_time.total_seconds()
+    length = tl.end_time.total_seconds() - start
+    pos = max(0.0, tl.position.total_seconds() - start)
+    age = None
+    if playing:
+        try:
+            from datetime import datetime, timezone
+            lut = tl.last_updated_time
+            if lut is not None and lut.year > 2000:
+                if lut.tzinfo is None:
+                    lut = lut.replace(tzinfo=timezone.utc)
+                a = (datetime.now(timezone.utc) - lut).total_seconds()
+                if 0 <= a <= 12 * 3600:
+                    age = a
+        except Exception:
+            age = None
+    return length, pos, age
+
+
 class MediaWorker(threading.Thread):
     """Reads the Windows 'now playing' session, the same source as the volume flyout."""
 
@@ -1186,38 +1375,45 @@ class MediaWorker(threading.Thread):
         except Exception:
             log.exception("media worker stopped")
 
-    async def _thumb(self, props, n):
+    async def _thumb(self, props):
+        """(fingerprint, png path) of the track's cover, (None, "") when it has none.
+
+        The file is named after a fingerprint of the image itself, not a counter: a different cover is always a different
+        file / url, so the QML image cache can never keep showing the previous one."""
         try:
             ref = props.thumbnail
             if ref is None:
-                return ""
+                return None, ""
             DataReader = _media_api()[1]
             from PIL import Image
             stream = await ref.open_read_async()
             size = stream.size
             if not size:
-                return ""
+                return None, ""
             reader = DataReader(stream)
             await reader.load_async(size)
             data = bytearray(size)
             reader.read_bytes(data)
-            im = Image.open(io.BytesIO(bytes(data))).convert("RGB")
-            w, h = im.size
-            s = min(w, h)
-            l, t = (w - s) // 2, (h - s) // 2
-            im = im.crop((l, t, l + s, t + s)).resize((256, 256), Image.Resampling.LANCZOS)
-            path = ART_DIR / f"art_{n}.png"
-            im.save(path)
+            data = bytes(data)
+            sig = hashlib.md5(data).hexdigest()[:12]
+            path = ART_DIR / f"art_{sig}.png"
+            if not path.exists():
+                im = Image.open(io.BytesIO(data)).convert("RGB")
+                w, h = im.size
+                s = min(w, h)
+                l, t = (w - s) // 2, (h - s) // 2
+                im = im.crop((l, t, l + s, t + s)).resize((256, 256), Image.Resampling.LANCZOS)
+                im.save(path)
             for old in ART_DIR.glob("art_*.png"):
                 if old != path and time.time() - old.stat().st_mtime > 30:
                     try:
                         old.unlink()
                     except OSError:
                         pass
-            return str(path)
+            return sig, str(path)
         except Exception:
             log.warning("thumbnail failed", exc_info=True)
-            return ""
+            return None, ""
 
     async def _main(self):
         self.loop = asyncio.get_running_loop()
@@ -1231,8 +1427,10 @@ class MediaWorker(threading.Thread):
         mgr = await Manager.request_async()
         self.mgr = mgr
         self._wake = asyncio.Event()
-        key, art, n = None, "", 0
-        pos_seen, pos_t = None, 0.0
+        key, art, art_sig = None, "", None
+        art_i, art_due = len(ART_RECHECK) + 1, 0.0      # cover re-check schedule for the current track (see ART_RECHECK)
+        clock = _PosClock()
+        last_len = 0.0
         props, tick = None, 0
         while True:
             try:
@@ -1255,20 +1453,36 @@ class MediaWorker(threading.Thread):
                         self.cur_aumid = aumid
                         self._repoll = False
                         props = None
-                    if props is None or tick % 2 == 0:   # every WinRT call allocates COM objects, so do it half as often
+                    art_check = art_i <= len(ART_RECHECK) and time.time() >= art_due
+                    if props is None or tick % 2 == 0 or art_check:   # every WinRT call allocates COM objects, so not every tick
                         props = await s.try_get_media_properties_async()
                         k = (props.title, props.artist, aumid)
-                        if k != key:
+                        new_track = k != key
+                        if new_track:
                             key = k
-                            n += 1
-                            art = await self._thumb(props, n)
+                            clock.reset()                  # a new track must not inherit the old one's position clock
+                            last_len = 0.0
+                            art_i, art_due = 0, 0.0        # read the cover now, then re-check it a few times
+                            art_check = True
+                        if art_check:
+                            sig, path = await self._thumb(props)
+                            if sig is not None:
+                                if sig != art_sig:
+                                    art_sig, art = sig, path
+                            elif new_track:
+                                art_sig, art = None, ""    # this track has no cover: don't keep showing the previous one
+                            art_due = time.time() + ART_RECHECK[min(art_i, len(ART_RECHECK) - 1)]
+                            art_i += 1
                     playing = int(s.get_playback_info().playback_status) == 4
-                    tl = s.get_timeline_properties()
-                    length = (tl.end_time - tl.start_time).total_seconds()
-                    pos = tl.position.total_seconds()
-                    if pos != pos_seen:
-                        pos_seen, pos_t = pos, time.time()
-                    shown = pos + ((time.time() - pos_t) if playing else 0)
+                    try:
+                        length, pos, age = _tl_read(s.get_timeline_properties(), playing)
+                    except Exception:
+                        length, pos, age = 0.0, 0.0, None   # this app has no timeline: title / cover still show
+                    if length > 0:
+                        last_len = length
+                    elif last_len > 0:
+                        length = last_len                  # some apps report 0 for a moment, keep the length we knew
+                    shown = clock.now(pos, playing, age)
                     if length > 0:
                         shown = min(shown, length)
                     src = media_source_name(s.source_app_user_model_id or "")
@@ -1276,7 +1490,8 @@ class MediaWorker(threading.Thread):
                         "title": props.title or "", "artist": props.artist or "", "source": src,
                         "playing": playing, "art": art,
                         "progress": (shown / length) if length > 0 else 0.0,
-                        "time": f"{_fmt(shown)} / {_fmt(length)}" if length > 0 else "",
+                        # no length (live stream ...): still show how long it has been playing
+                        "time": (f"{_fmt(shown)} / {_fmt(length)}" if length > 0 else (_fmt(shown) if shown >= 1 else "")),
                     })
             except Exception:
                 log.warning("media poll failed", exc_info=True)
@@ -1389,6 +1604,14 @@ DEFAULT_THEME = {
 def argb_alpha(c, a):
     """'#AARRGGBB' with a different alpha."""
     return "#%02x%s" % (round(max(0.0, min(1.0, a)) * 255), c[3:9])
+
+
+def retint_fill(fill, v):
+    """'#AARRGGBB' with the same hue / saturation but a fixed brightness (HSV value)."""
+    import colorsys
+    h, s_, _v = colorsys.rgb_to_hsv(*(int(fill[i:i + 2], 16) / 255.0 for i in (3, 5, 7)))
+    r, g, b = (round(c * 255) for c in colorsys.hsv_to_rgb(h, s_, max(0.0, min(1.0, v))))
+    return "#ff%02x%02x%02x" % (r, g, b)
 
 
 ICON_VALUE = 0.74         # brightness of the icon colours that follow the wallpaper (1.0 = as bright as it gets, 0.6 = dim)
@@ -1834,6 +2057,94 @@ def hicon_rgba(hicon):
             gdi32.DeleteObject(ii.hbmMask)
 
 
+# ---- taskbar-style peek: hover an app in the bar -> a card per window with a live-ish thumbnail, hover a card -> the real window ----
+user32.PrintWindow.argtypes = [wintypes.HWND, _vp, wintypes.UINT]
+user32.PrintWindow.restype = wintypes.BOOL
+gdi32.CreateCompatibleDC.argtypes = [_vp]
+gdi32.CreateCompatibleDC.restype = _vp
+gdi32.CreateCompatibleBitmap.argtypes = [_vp, ctypes.c_int, ctypes.c_int]
+gdi32.CreateCompatibleBitmap.restype = _vp
+gdi32.SelectObject.argtypes = [_vp, _vp]
+gdi32.SelectObject.restype = _vp
+gdi32.DeleteDC.argtypes = [_vp]
+
+
+def capture_window(hwnd, max_w=360, max_h=220):
+    """QImage snapshot of a window (PrintWindow with PW_RENDERFULLCONTENT, so GPU / Electron windows work too),
+        or None for minimized / vanished windows (the card then shows the app icon instead)."""
+    if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd):
+        return None
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return None
+    w, h = r.right - r.left, r.bottom - r.top
+    if w < 16 or h < 16 or w > 8192 or h > 8192:
+        return None
+    sdc = user32.GetDC(None)
+    mdc = bmp = old = None
+    try:
+        mdc = gdi32.CreateCompatibleDC(sdc)
+        bmp = gdi32.CreateCompatibleBitmap(sdc, w, h)
+        if not mdc or not bmp:
+            return None
+        old = gdi32.SelectObject(mdc, bmp)
+        if not user32.PrintWindow(hwnd, mdc, 2):
+            return None
+        gdi32.SelectObject(mdc, old)                  # the bitmap must be out of the DC before GetDIBits
+        old = None
+        bi = _BMIH()
+        bi.biSize = ctypes.sizeof(_BMIH)
+        bi.biWidth, bi.biHeight, bi.biPlanes, bi.biBitCount = w, -h, 1, 32
+        buf = ctypes.create_string_buffer(w * h * 4)
+        if not gdi32.GetDIBits(mdc, bmp, 0, h, buf, ctypes.byref(bi), 0):
+            return None
+        img = QImage(buf.raw, w, h, w * 4, QImage.Format.Format_RGB32).copy()
+        if w > max_w or h > max_h:
+            img = img.scaled(max_w, max_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        return img
+    finally:
+        if old:
+            gdi32.SelectObject(mdc, old)
+        if bmp:
+            gdi32.DeleteObject(bmp)
+        if mdc:
+            gdi32.DeleteDC(mdc)
+        if sdc:
+            user32.ReleaseDC(None, sdc)
+
+
+if QQuickImageProvider is not None:
+    class WinThumbProvider(QQuickImageProvider):
+        def __init__(self):
+            super().__init__(_IMG_TYPE)
+
+        def requestImage(self, id, size, requestedSize):
+            img = None
+            try:
+                img = capture_window(int(str(id).split("?")[0]))
+            except Exception:
+                log.exception("thumbnail")
+            if img is None:
+                img = QImage(1, 1, QImage.Format.Format_ARGB32)      # 1x1 = "no picture", the card shows the app icon
+                img.fill(0)
+            return img
+
+
+# The peek is Vapor's own: a dark screen-sized window (Vapor.qml "Vapor Peek") sits under the bar and frame, and the
+# hovered window is drawn into it as a live DWM thumbnail at its real position. Windows' built-in peek hides every
+# window it doesn't know about, including your bar and borders, so it can't be used here.
+_dwm = ctypes.WinDLL("dwmapi")
+_dwm.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(ctypes.c_void_p)]
+_dwm.DwmUpdateThumbnailProperties.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_dwm.DwmUnregisterThumbnail.argtypes = [ctypes.c_void_p]
+_dwm.DwmQueryThumbnailSourceSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.SIZE)]
+
+
+class _DWM_THUMB(ctypes.Structure):
+    _fields_ = [("dwFlags", wintypes.DWORD), ("rcDestination", wintypes.RECT), ("rcSource", wintypes.RECT),
+                ("opacity", ctypes.c_ubyte), ("fVisible", wintypes.BOOL), ("fSourceClientAreaOnly", wintypes.BOOL)]
+
+
 def tray_icon_url(hicon):
     r = hicon_rgba(hicon)
     if not r:
@@ -2201,6 +2512,12 @@ class Backend(QObject):
     wifiConnectedChanged = Signal(); wifiConnected = Property(bool, lambda s: s._v["wifiConnected"], notify=wifiConnectedChanged)
     fullscreenChanged = Signal(); fullscreen = Property(bool, lambda s: s._v["fullscreen"], notify=fullscreenChanged)
     userHiddenChanged = Signal(); userHidden = Property(bool, lambda s: s._v["userHidden"], notify=userHiddenChanged)
+    ramUsedChanged = Signal(); ramUsed = Property(float, lambda s: s._v["ramUsed"], notify=ramUsedChanged)
+    ramTotalChanged = Signal(); ramTotal = Property(float, lambda s: s._v["ramTotal"], notify=ramTotalChanged)
+    gpuUsedChanged = Signal(); gpuUsed = Property(float, lambda s: s._v["gpuUsed"], notify=gpuUsedChanged)
+    gpuTotalChanged = Signal(); gpuTotal = Property(float, lambda s: s._v["gpuTotal"], notify=gpuTotalChanged)
+    gpuNameChanged = Signal(); gpuName = Property(str, lambda s: s._v["gpuName"], notify=gpuNameChanged)
+    gpuStateChanged = Signal(); gpuState = Property(str, lambda s: s._v["gpuState"], notify=gpuStateChanged)
     mutedChanged = Signal(); muted = Property(bool, lambda s: s._v["muted"], notify=mutedChanged)
     mediaPlayingChanged = Signal(); mediaPlaying = Property(bool, lambda s: s._v["mediaPlaying"], notify=mediaPlayingChanged)
     mediaProgressChanged = Signal(); mediaProgress = Property(float, lambda s: s._v["mediaProgress"], notify=mediaProgressChanged)
@@ -2235,6 +2552,7 @@ class Backend(QObject):
     mediaIn = Signal(object)
     glassIn = Signal(object)
     fsIn = Signal(object)
+    statsIn = Signal(object)
     fgIn = Signal()
     vizIn = Signal(object)
     toggleIn = Signal()
@@ -2244,6 +2562,7 @@ class Backend(QObject):
     outsideClick = Signal()
     appNotice = Signal(str, str, str)     # app name, title, body of a notification from another app
     cliIn = Signal(object)                # a command from vaporctl.py (arrives on the CLI server thread)
+    peekOverlay = Signal(bool)            # show / hide the dark peek backdrop window (Vapor.qml)
     cliCommand = Signal(str, str)         # CLI commands QML has to carry out: alert / dismiss / timer / remind
     clockPoke = Signal()                  # once a second QML checks its timer + reminders (an OS timer, independent of Qt Quick's animation clock)
 
@@ -2259,6 +2578,7 @@ class Backend(QObject):
             mediaTime="", weatherIcon="", weatherTemp="", weatherDesc="", weatherRange="", weatherData="",
             screenX=g.x(), screenY=g.y(), screenW=g.width(), screenH=min(g.height(), STRIP_H), fullH=g.height(), sideMargin=0, battery=100, wsCount=0,
             wsActive=0, volume=0, fgSerial=0, hasBattery=False, wifiConnected=False, fullscreen=False, userHidden=False,
+            ramUsed=0.0, ramTotal=0.0, gpuUsed=0.0, gpuTotal=0.0, gpuName="", gpuState="wait",
             muted=False, mediaPlaying=False, mediaProgress=0.0, wsPopulated=[],
             noGlass=False, stripMode=True, netKind="", outputs=[], defaultOutput="", komoOnline=False, layout="", vizActive=False, vizBars=[0.0] * 6, trayCount=0, trayPinnedCount=0,
             uptime="", userAvatar="", userName=load_config()["userName"] or os.environ.get("USERNAME", "user"),
@@ -2305,6 +2625,7 @@ class Backend(QObject):
         self.mediaIn.connect(self._on_media)
         self.glassIn.connect(self._on_glass)
         self.fsIn.connect(self._on_fs)
+        self.statsIn.connect(self._on_stats)
         self.fgIn.connect(self._on_fg)
         self.outsideIn.connect(self.outsideClick)
         self.vizIn.connect(self._on_viz)
@@ -2331,7 +2652,8 @@ class Backend(QObject):
         self._clock_t.setTimerType(Qt.TimerType.PreciseTimer)
         self._clock_t.timeout.connect(self.clockPoke)
         self._clock_t.start(1000)
-        for fn in (hotkey_loop, memory_loop, glass_loop, komorebi_loop, tasks_loop, wifi_loop, phones_loop, viz_loop, tray_loop, notif_loop, status_loop, click_outside_loop):
+        self._stats_ev = threading.Event()          # set while the side panel is open: RAM / GPU memory are only read then
+        for fn in (hotkey_loop, memory_loop, glass_loop, komorebi_loop, tasks_loop, wifi_loop, phones_loop, viz_loop, tray_loop, notif_loop, status_loop, click_outside_loop, ram_loop, gpu_loop):
             threading.Thread(target=fn, args=(self,), daemon=True).start()
         self._media.start()
 
@@ -2657,6 +2979,18 @@ class Backend(QObject):
     @Slot(object)
     def _on_fs(self, on):
         self.put("fullscreen", bool(on))
+
+    @Slot(object)
+    def _on_stats(self, d):
+        for k, v in d.items():
+            self.put(k, v)
+
+    @Slot(bool)
+    def statsWatch(self, on):
+        if on:
+            self._stats_ev.set()
+        else:
+            self._stats_ev.clear()
 
     @Slot()
     def _on_toggle(self):
@@ -3005,6 +3339,8 @@ class Backend(QObject):
                 if above not in own and user32.IsWindowVisible(above):
                     if class_of(above) in self.MENU_CLASSES:
                         return True
+                    if HIDE_ON_SNIP and is_snip_overlay(above, self.pw, self.ph):
+                        return True                  # the screenshot overlay is up: don't raise the bar over it
                     if pid_of(above) == me:
                         r = wintypes.RECT()
                         user32.GetWindowRect(above, ctypes.byref(r))
@@ -3030,6 +3366,10 @@ class Backend(QObject):
                 if w.title() in ("Vapor", "Vapor Popup", "Vapor L", "Vapor R", "Vapor B"):
                     wins[w.title()] = int(w.winId())
             own = set(wins.values())
+            for title in ("Synapse Shell", "Synapse Shell L", "Synapse Shell R"):    # Synapse's >shell card + its two flares
+                hw = user32.FindWindowW(None, title)
+                if hw:
+                    own.add(hw)
             for title in ("Vapor", "Vapor Popup"):
                 hw = wins.get(title)
                 if not hw or not user32.IsWindow(hw) or not user32.IsWindowVisible(hw):
@@ -3085,20 +3425,53 @@ class Backend(QObject):
         try:
             ov, wall = self._ov, self._wall
             outline = ov.get("outline") or wall["outline"]
-            self.put("glassColor", ov.get("glass") or wall["glass"])
+            glass = ov.get("glass") or wall["glass"]
+            fv = self._settings.get("fillV")
+            if LOCK_DARK_VARIANT:                # wallpaper hue, always the dark variant's brightness
+                glass = retint_fill(wall["glass"], fv if isinstance(fv, (int, float)) else FILL_MAX_V)
+            self.put("glassColor", glass)
+            log.info("theme: overrides=%s wall=%s -> glass %s outline %s", sorted(ov), wall, glass, outline)
             self.put("glassOutline", outline)
             self.put("themeOutline", argb_alpha(outline, 0.34))
             icons = ({k: ov[k] for k in ("accent", "blue", "lavender", "hover")} if ov.get("accent")
                      else wallpaper_icons(wall["outline"]))
             for k, val in icons.items():
                 self.put("theme" + k.capitalize(), val)
+            self._write_shell_colors()
         except Exception:
             log.exception("refresh colours")
+
+    def _write_shell_colors(self):
+        """Synapse's >shell mode reads the final shell colours and the bar geometry from shell_colors.json (only rewritten
+                when something changed), so the launcher can sit under the bar in exactly the same glass."""
+        try:
+            v = self._v
+            d = {"glass": v.get("glassColor"), "outline": v.get("glassOutline"), "accent": v.get("themeAccent"),
+                 "blue": v.get("themeBlue"), "lavender": v.get("themeLavender"), "hover": v.get("themeHover"),
+                 "barH": PILL_H, "x": v.get("screenX"), "y": v.get("screenY"), "w": v.get("screenW")}
+            if d == getattr(self, "_shell_dump", None):
+                return
+            self._shell_dump = d
+            tmp = DATA / "shell_colors.json.tmp"
+            tmp.write_text(json.dumps(d), encoding="utf-8")
+            os.replace(tmp, DATA / "shell_colors.json")
+        except Exception:
+            log.exception("write shell colours")
 
     def applyThemeColors(self, d):
         """Overrides from the control center's theme card (live) and the saved ones at start. Missing keys follow
                 the wallpaper, an empty dict means everything follows the wallpaper."""
         self._ov = dict(d or {})
+        g = self._ov.get("glass")
+        if LOCK_DARK_VARIANT and isinstance(g, str) and len(g) >= 9:
+            try:            # remember how dark the chosen / saved shell colour is, it outlives "follow wallpaper" and restarts
+                import colorsys
+                v = round(colorsys.rgb_to_hsv(*(int(g[i:i + 2], 16) / 255.0 for i in (3, 5, 7)))[2], 4)
+                if self._settings.get("fillV") != v:
+                    self._settings["fillV"] = v
+                    save_settings(dict(self._settings))
+            except Exception:
+                log.exception("fill brightness")
         self._refresh_colors()
 
     # notification
@@ -3498,6 +3871,119 @@ class Backend(QObject):
         if g:
             user32.PostMessageW(g["hwnds"][0], 0x0010, 0, 0)  # WM_CLOSE
 
+    # ---- peek (hover an app in the bar) ----
+    @Slot(str, result="QVariantList")
+    def taskWindows(self, key):
+        """The windows of one app in the bar: [{hwnd (as text, a window handle can overflow a QML int), title}]"""
+        g = self._groups.get(key)
+        out = []
+        for h in (g["hwnds"] if g else []):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, buf, 256)
+            out.append({"hwnd": str(int(h)), "title": buf.value or os.path.splitext(os.path.basename(g["exe"]))[0]})
+        return out
+
+    @Slot(str)
+    def peekStart(self, hwnd_s):
+        try:
+            target = int(hwnd_s)
+            if not user32.IsWindow(target):
+                return
+            self._peek_drop()                                  # moving between cards: swap the picture, keep the backdrop
+            self._peek_target = target
+            was = getattr(self, "_peeking", False)
+            self._peeking = True
+            if not was:
+                self.peekOverlay.emit(True)                    # QML shows the backdrop window
+            QTimer.singleShot(0 if was else 70, lambda: self._peek_go(target))   # a new window needs a moment to exist
+        except Exception:
+            log.exception("peek start")
+
+    def _peek_drop(self):
+        th = getattr(self, "_peek_thumb", 0)
+        self._peek_thumb = 0
+        if th:
+            try:
+                _dwm.DwmUnregisterThumbnail(ctypes.c_void_p(th))
+            except Exception:
+                log.exception("peek: unregister")
+
+    def _peek_go(self, target):
+        if not getattr(self, "_peeking", False) or getattr(self, "_peek_target", 0) != target:
+            return                                             # the mouse already left
+        try:
+            bar = self._bar()
+            ov = user32.FindWindowW(None, "Vapor Peek")
+            if not bar or not ov or not user32.IsWindow(target):
+                log.warning("peek: backdrop window not found (bar=%s, backdrop=%s)", bar, ov)
+                self.peekStop()
+                return
+            mon = user32.MonitorFromWindow(bar, 2)
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(mi)
+            if not mon or not user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                self.peekStop()
+                return
+            m = mi.rcMonitor
+            mw, mh = m.right - m.left, m.bottom - m.top
+            # backdrop over every normal window, then the bar goes back on top of it (its popup is owned by it and follows)
+            user32.SetWindowPos(wintypes.HWND(ov), wintypes.HWND(-1), m.left, m.top, mw, mh, 0x0010 | 0x0040)   # NOACTIVATE | SHOWWINDOW
+            user32.SetWindowPos(wintypes.HWND(bar), wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)   # NOSIZE | NOMOVE | NOACTIVATE
+            th = ctypes.c_void_p()
+            hr = _dwm.DwmRegisterThumbnail(wintypes.HWND(ov), wintypes.HWND(target), ctypes.byref(th))
+            if hr != 0 or not th.value:
+                log.warning("peek: DwmRegisterThumbnail failed 0x%08x", hr & 0xFFFFFFFF)
+                self.peekStop()
+                return
+            self._peek_thumb = th.value
+            sz = wintypes.SIZE()
+            _dwm.DwmQueryThumbnailSourceSize(th, ctypes.byref(sz))
+            r = wintypes.RECT()
+            user32.GetWindowRect(target, ctypes.byref(r))
+            if user32.IsIconic(target) or r.left <= -30000 or r.right - r.left < 16:
+                sw, sh = max(1, sz.cx), max(1, sz.cy)          # minimized: no position to show it at, so fit it in the middle
+                k = min(mw * 0.86 / sw, mh * 0.8 / sh)
+                dw, dh = int(sw * k), int(sh * k)
+                dl, dt = (mw - dw) // 2, (mh - dh) // 2
+                dest = (dl, dt, dl + dw, dt + dh)
+            else:
+                dest = (r.left - m.left, r.top - m.top, r.right - m.left, r.bottom - m.top)
+            props = _DWM_THUMB()
+            props.dwFlags = 0x1 | 0x4 | 0x8                    # destination rect, opacity, visible
+            props.rcDestination = wintypes.RECT(*dest)
+            props.opacity = 255
+            props.fVisible = True
+            props.fSourceClientAreaOnly = False
+            _dwm.DwmUpdateThumbnailProperties(th, ctypes.byref(props))
+        except Exception:
+            log.exception("peek go")
+            self.peekStop()
+
+    @Slot()
+    def peekStop(self):
+        self._peek_drop()
+        if getattr(self, "_peeking", False):
+            self._peeking = False
+            self.peekOverlay.emit(False)
+
+    @Slot(str)
+    def peekActivate(self, hwnd_s):
+        self.peekStop()
+        try:
+            h = int(hwnd_s)
+            if user32.IsWindow(h):
+                activate_window(h)
+        except Exception:
+            log.exception("peek activate")
+
+    @Slot(str)
+    def peekClose(self, hwnd_s):
+        self.peekStop()
+        try:
+            user32.PostMessageW(int(hwnd_s), 0x0010, 0, 0)  # WM_CLOSE
+        except Exception:
+            log.exception("peek close")
+
     @Slot()
     def mediaPlayPause(self):
         self._media.act("toggle")
@@ -3843,6 +4329,11 @@ def main():
         for qml_dir in (HERE / "PySide6" / "Qt" / "qml", HERE / "PySide6" / "qml"):
             if qml_dir.is_dir():
                 engine.addImportPath(str(qml_dir))
+    if QQuickImageProvider is not None:
+        try:
+            engine.addImageProvider("winthumb", WinThumbProvider())
+        except Exception:
+            log.exception("thumbnail provider")
     ctx = engine.rootContext()
     ctx.setContextProperty("B", backend)
     ctx.setContextProperty("CC", cc_backend)
@@ -3873,8 +4364,13 @@ def main():
             log.exception("appbar")
 
     app.aboutToQuit.connect(lambda: backend.set_reserve(False))
+    app.aboutToQuit.connect(backend.peekStop)
     QTimer.singleShot(400, reserve)
     backend.start()
+    try:
+        ensure_cli_shim()
+    except Exception:
+        log.exception("could not write the vaporctl shim")
     try:
         ensure_on_path()
     except Exception:

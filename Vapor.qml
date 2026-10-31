@@ -71,6 +71,20 @@ Window {
     property date now: new Date()
     property string page: ""                 // "", media, volume, clock, tray, control
     property string lastPage: "media"
+    // taskbar-style peek: hovering an app in the bar lists its windows, hovering a card there shows the real window
+    property var peekWins: []
+    property string peekIcon: ""
+    property int peekTick: 0
+    readonly property int peekOpenDelay: 450      // ms you hover an app in the bar before its window cards pop out
+    readonly property int peekFullDelay: 650      // ms you hover a card before the full-window peek starts
+    function peekSet(key, icon) { peekIcon = icon; peekWins = B.taskWindows(key); peekTick++ }
+    function peekCloseWin(h) {
+        B.peekClose(h)
+        var a = []
+        for (var i = 0; i < peekWins.length; i++) if (peekWins[i].hwnd !== h) a.push(peekWins[i])
+        peekWins = a
+        if (a.length === 0) page = ""
+    }
     // set while the power menu grabs its desktop backdrop, the popup then retracts at once instead of springing shut
     property bool snapClose: false
     // true while the full-screen power menu is up. the control center stays open underneath and only retracts
@@ -103,7 +117,7 @@ Window {
             bar.sideOutside()                                                // ...and outside the side panel while a note is being edited
         }
     }
-    onPageChanged: { if (page !== "clock") { clockTyping = false; clockPage.cancelEdit() } else clockPage.resetToNow(); if (page === "control") sideWant = false; if (page !== "") lastPage = page; if (page !== "tray") { trayHold = false; trayHoldTimer.stop() } B.setControlOpen(page === "control") }
+    onPageChanged: { if (page !== "clock") { clockTyping = false; clockPage.cancelEdit() } else clockPage.resetToNow(); if (page === "control") sideWant = false; if (page !== "") lastPage = page; if (page !== "tray") { trayHold = false; trayHoldTimer.stop() } B.setControlOpen(page === "control"); if (page !== "peek") B.peekStop() }
     onRevealChanged: syncClip()
     // the click region used to be re-sent to Windows on every animation frame while a popup grew or moved (60 SetWindowRgn
     // calls a second), which makes dwm.exe rebuild the window over and over. now it follows the popup's target box,
@@ -172,8 +186,8 @@ Window {
         return m[n] !== undefined ? m[n] : "\udb81\ude40"
     }
 
-    function pageW(p) { return p === "tray" ? 292 : p === "control" ? 380 + ccOver : p === "media" ? 380 : p === "volume" ? 300 : p === "clock" ? 330 : 300 }
-    function pageH(p) { return p === "tray" ? trayPage.h : p === "control" ? Math.min(ccPage.pageHeight, B.fullH - barH - frameW - 6) : p === "media" ? 176 : p === "volume" ? (B.outputs.length > 0 ? 122 + outFlow.height + 14 : 124) : p === "clock" ? clockPage.h : 100 }
+    function pageW(p) { return p === "peek" ? peekPage.w : p === "tray" ? 292 : p === "control" ? 380 + ccOver : p === "media" ? 380 : p === "volume" ? 300 : p === "clock" ? 330 : 300 }
+    function pageH(p) { return p === "peek" ? peekPage.h : p === "tray" ? trayPage.h : p === "control" ? Math.min(ccPage.pageHeight, B.fullH - barH - frameW - 6) : p === "media" ? 176 : p === "volume" ? (B.outputs.length > 0 ? 122 + outFlow.height + 14 : 124) : p === "clock" ? clockPage.h : 100 }
 
     // ---- clock page building blocks ----
                         // small rounded button used all over this page
@@ -393,6 +407,50 @@ Window {
         onWheel: (w) => {
             acc += w.angleDelta.y
             if (Math.abs(acc) >= 120) { B.mediaCycle(acc > 0 ? -1 : 1); acc = 0 }
+        }
+    }
+
+    // a card of the dashboard: the same flat colour for every card, it glides in (staggered by `order`) while `enter` runs 0 -> 1
+    component DashCard: Rectangle {
+        id: dc
+        property real enter: 1
+        property int order: 0
+        readonly property real t: Math.max(0, Math.min(1, (enter - order * 0.09) / 0.55))
+        readonly property real p: 1 - Math.pow(1 - t, 3)
+        radius: 18
+        antialiasing: true
+        color: Qt.rgba(1, 1, 1, 0.07)
+        opacity: p
+        transform: Translate { y: (1 - dc.p) * 24 }
+    }
+
+    // circular usage gauge (0..1), the arc glides to new values
+    component RingGauge: Canvas {
+        id: rg
+        property real frac: 0
+        property color ringColor: bar.accent
+        property real shown: 0
+        Behavior on shown { NumberAnimation { duration: 450; easing.type: Easing.OutCubic } }
+        onFracChanged: shown = frac
+        onShownChanged: requestPaint()
+        onRingColorChanged: requestPaint()
+        onWidthChanged: requestPaint()
+        onPaint: {
+            var c = getContext("2d")
+            c.reset()
+            var lw = 7, r = width / 2 - lw / 2 - 1, cx = width / 2, cy = height / 2
+            c.lineWidth = lw
+            c.lineCap = "round"
+            c.strokeStyle = Qt.rgba(1, 1, 1, 0.12)
+            c.beginPath()
+            c.arc(cx, cy, r, 0, 2 * Math.PI, false)
+            c.stroke()
+            if (shown > 0.004) {
+                c.strokeStyle = ringColor
+                c.beginPath()
+                c.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + 2 * Math.PI * Math.min(1, shown), false)
+                c.stroke()
+            }
         }
     }
 
@@ -640,7 +698,7 @@ Window {
     function showPage(name, item) {
         if (page === "control" && name !== "control") return
         if (trayBusy && name !== "tray") return          // dragging a tray icon: hovering other chips must not swap the popup away
-        if (page === name) return
+        if (page === name && name !== "peek") return       // peek: another app's icon, same popup, it just slides over
         anchorX = item.mapToItem(null, item.width / 2, 0).x
         page = name
     }
@@ -1029,6 +1087,11 @@ Window {
                             Behavior on width { SpringAnimation { spring: 4; damping: 0.4; epsilon: 0.25 } }
                             Behavior on color { ColorAnimation { duration: 200 } }
                         }
+                        Timer {
+                            id: peekOpen
+                            interval: bar.peekOpenDelay
+                            onTriggered: if (tdMouse.containsMouse) { bar.peekSet(td.appKey, td.iconUrl); bar.chipHover("peek", td, true) }
+                        }
                         MouseArea {
                             id: tdMouse
                             anchors.fill: parent
@@ -1037,7 +1100,17 @@ Window {
                             hoverEnabled: true
                             acceptedButtons: Qt.LeftButton | Qt.MiddleButton
                             cursorShape: Qt.PointingHandCursor
+                            onContainsMouseChanged: {
+                                if (containsMouse) {
+                                    if (bar.page === "peek") { bar.peekSet(td.appKey, td.iconUrl); bar.chipHover("peek", td, true) }   // already out: slide straight over
+                                    else peekOpen.restart()
+                                } else {
+                                    peekOpen.stop()
+                                    bar.chipHover("peek", td, false)
+                                }
+                            }
                             onClicked: (m) => {
+                                B.peekStop()
                                 if (m.button === Qt.MiddleButton) B.taskClose(td.appKey)
                                 else B.taskClick(td.appKey)
                             }
@@ -1392,6 +1465,24 @@ Window {
         }
     }
 
+    // ---- peek backdrop ----
+    // the taskbar-style peek: this dark screen-sized window sits under the bar + frame (so your borders stay), the backend
+    // draws the hovered window into it as a live picture at its real position. click-through, only there while peeking.
+    property bool peekShow: false
+    Connections { target: B; function onPeekOverlay(on) { bar.peekShow = on } }
+    Window {
+        id: peekBackdrop
+        title: "Vapor Peek"
+        transientParent: null            // not owned by the bar: an owned window would always sit above it
+        visible: bar.peekShow && bar.shown
+        color: "#0c0c12"
+        flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowDoesNotAcceptFocus | Qt.WindowTransparentForInput
+        x: B.screenX
+        y: B.screenY
+        width: B.screenW
+        height: B.screenH
+    }
+
     // ---- popup window ----
     // its own small transparent window, only shown while a popup is out. (a screen-sized transparent window makes
     // dwm.exe balloon to GBs while it animates, small ones don't.) it follows the popup's box (popX/popW/popH,
@@ -1457,6 +1548,116 @@ Window {
                         onCloseRequested: bar.page = ""
                         onPowerRequested: bar.openPower()
                         Behavior on opacity { NumberAnimation { duration: 220 * bar.popSpeed; easing.type: Easing.BezierSpline; easing.bezierCurve: bar.curveStandard } }
+                    }
+
+                    // ---- taskbar peek ----
+                    // one card per window of the hovered app. hovering a card (after a short pause) shows that real window
+                    // with everything else hidden, like the Windows taskbar. click = switch to it, X / middle click = close it.
+                    Item {
+                        id: peekPage
+                        readonly property int n: bar.peekWins.length
+                        readonly property int perRow: 4
+                        readonly property int cols: Math.max(1, Math.min(n, perRow))
+                        readonly property int rows: Math.max(1, Math.ceil(n / perRow))
+                        readonly property real cardW: 176
+                        readonly property real cardH: 124
+                        readonly property real w: cols * (cardW + 8) + 8
+                        readonly property real h: rows * (cardH + 8) + 8
+                        width: w
+                        height: h
+                        x: (parent.width - width) / 2
+                        opacity: bar.page === "peek" ? 1 : 0
+                        visible: opacity > 0.01
+                        Behavior on opacity { NumberAnimation { duration: 220 * bar.popSpeed; easing.type: Easing.BezierSpline; easing.bezierCurve: bar.curveStandard } }
+
+                        Flow {
+                            x: 8
+                            y: 8
+                            width: peekPage.width - 16
+                            spacing: 8
+                            Repeater {
+                                model: bar.peekWins
+                                delegate: Item {
+                                    id: pc
+                                    required property var modelData
+                                    width: peekPage.cardW
+                                    height: peekPage.cardH
+
+                                    Rectangle {
+                                        anchors.fill: parent
+                                        radius: 12
+                                        color: bar.hoverColor
+                                        opacity: pcMouse.containsMouse ? 1 : 0
+                                        Behavior on opacity { NumberAnimation { duration: 140 } }
+                                    }
+                                    Image {
+                                        x: 10; y: 8
+                                        width: 14; height: 14
+                                        source: bar.peekIcon
+                                        sourceSize: Qt.size(28, 28)
+                                        smooth: true
+                                    }
+                                    Text {
+                                        x: 30; y: 7
+                                        width: parent.width - 30 - 30
+                                        text: pc.modelData.title
+                                        elide: Text.ElideRight
+                                        color: "white"
+                                        font.family: bar.uiFont
+                                        font.pixelSize: 11
+                                    }
+                                    Image {
+                                        id: thumb
+                                        x: 8; y: 28
+                                        width: parent.width - 16
+                                        height: parent.height - 36
+                                        source: "image://winthumb/" + pc.modelData.hwnd + "?" + bar.peekTick
+                                        asynchronous: true
+                                        cache: false
+                                        fillMode: Image.PreserveAspectFit
+                                        smooth: true
+                                        mipmap: true
+                                        visible: status === Image.Ready && implicitWidth > 2
+                                    }
+                                    Image {                    // minimized / can't be captured: the app's icon instead
+                                        anchors.centerIn: thumb
+                                        width: 36; height: 36
+                                        source: bar.peekIcon
+                                        sourceSize: Qt.size(72, 72)
+                                        smooth: true
+                                        visible: !thumb.visible && thumb.status !== Image.Loading
+                                    }
+                                    MouseArea {
+                                        id: pcMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+                                        onEntered: peekTimer.restart()
+                                        onExited: { peekTimer.stop(); B.peekStop() }
+                                        onClicked: (m) => {
+                                            if (m.button === Qt.MiddleButton) bar.peekCloseWin(pc.modelData.hwnd)
+                                            else { B.peekActivate(pc.modelData.hwnd); bar.page = "" }
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 18; height: 18; radius: 9
+                                        x: parent.width - 26; y: 5
+                                        color: xMouse.containsMouse ? Qt.rgba(0.9, 0.25, 0.3, 0.9) : "transparent"
+                                        opacity: (pcMouse.containsMouse || xMouse.containsMouse) ? 1 : 0
+                                        Behavior on opacity { NumberAnimation { duration: 120 } }
+                                        Text { anchors.centerIn: parent; text: "\u2715"; color: "white"; font.pixelSize: 9 }
+                                        MouseArea {
+                                            id: xMouse
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            onClicked: bar.peekCloseWin(pc.modelData.hwnd)
+                                        }
+                                    }
+                                    Timer { id: peekTimer; interval: bar.peekFullDelay; onTriggered: B.peekStart(pc.modelData.hwnd) }
+                                    Component.onDestruction: B.peekStop()
+                                }
+                            }
+                        }
                     }
 
                     // ---- system tray ----
@@ -2261,9 +2462,17 @@ Window {
                                     radius: 10
                                     antialiasing: true
                                     color: Qt.rgba(0, 0, 0, 0.28)
-                                    border.width: 1
-                                    border.color: remInput.activeFocus ? bar.accent : Qt.rgba(1, 1, 1, 0.14)
-                                    Behavior on border.color { ColorAnimation { duration: 90 } }
+                                    // the outline is its own rectangle: a border on a see-through fill leaves a dark seam where the corner meets the straight edge
+                                    Rectangle {
+                                        z: 1
+                                        anchors.fill: parent
+                                        radius: parent.radius
+                                        antialiasing: true
+                                        color: "transparent"
+                                        border.width: 1
+                                        border.color: remInput.activeFocus ? bar.accent : Qt.rgba(1, 1, 1, 0.14)
+                                        Behavior on border.color { ColorAnimation { duration: 90 } }
+                                    }
                                     // live preview: the styled copy of the text, right in the box
                                     LiveLine { anchors.fill: parent; anchors.leftMargin: 12; anchors.rightMargin: 12; input: remInput }
                                     TextInput {
@@ -2485,12 +2694,12 @@ Window {
     onShownChanged: if (!shown) { sideWant = false; sideTyping = false; dockWant = false }
     NumberAnimation { id: sideAnim; target: bar; property: "sideP"; easing.type: Easing.BezierSpline }
     Timer { id: sideOpenDelay; interval: 110; onTriggered: bar.sideWant = true }
-    Timer { id: sideCloseDelay; interval: 60; onTriggered: if (!edgeR.handleHovered && !sidePanelHover.hovered && !sidePanel.composing) bar.sideWant = false }
+    Timer { id: sideCloseDelay; interval: 60; onTriggered: if (!edgeR.handleHovered && !sidePanelHover.hovered && !sidePanel.composing && !bar.sideTyping) bar.sideWant = false }
     // panel folded away: the note editor closes with it (unsaved text is dropped) and "New note" has to be pressed again
-    onSideWantChanged: if (!sideWant) { sidePanel.closeComposer(); sideTyping = false }
+    onSideWantChanged: if (!sideWant) { sidePanel.closeComposer(); sideTyping = false; searchEdit.text = "" }
     // a click / focus loss somewhere that isn't the panel or its edge handle: this is what closes the panel while a note is open
     function sideOutside() {
-        if (sideWant && sidePanel.composing && !sidePanelHover.hovered && !edgeR.handleHovered) sideWant = false
+        if (sideWant && (sidePanel.composing || bar.sideTyping) && !sidePanelHover.hovered && !edgeR.handleHovered) sideWant = false
     }
     function sideHover(on) {
         if (on) { sideCloseDelay.stop(); if (!sideWant) sideOpenDelay.restart() }
@@ -2510,11 +2719,26 @@ Window {
         var h = (title || "").trim(), t = (text || "").trim()
         if (h === "" && t === "") return false
         var a = notes.slice()
-        if (idx >= 0 && idx < a.length) a.splice(idx, 1)
-        a.unshift({ title: h, t: t, ts: Date.now() })
-        notes = a
+        var pin = false
+        if (idx >= 0 && idx < a.length) { pin = a[idx].pin === true; a.splice(idx, 1) }
+        a.unshift({ title: h, t: t, ts: Date.now(), pin: pin })
+        notes = notesPinFirst(a)
         notesSave()
         return true
+    }
+    // pinned notes always sit at the top (order inside each group stays newest first)
+    function notesPinFirst(a) {
+        var p = [], r = []
+        for (var i = 0; i < a.length; i++) (a[i].pin === true ? p : r).push(a[i])
+        return p.concat(r)
+    }
+    function noteTogglePin(i) {
+        var a = notes.slice()
+        if (i < 0 || i >= a.length) return
+        var o = a[i]
+        a[i] = { title: o.title, t: o.t, ts: o.ts, pin: !(o.pin === true) }
+        notes = notesPinFirst(a)
+        notesSave()
     }
     function noteDelete(i) {
         var a = notes.slice()
@@ -2573,6 +2797,9 @@ Window {
         t = t.replace(/\*\*([\s\S]+?)\*\*/g, "\u0001<b>$1</b>\u0001")
         t = t.replace(/\*([^*\n]+?)\*/g, "\u0002<i>$1</i>\u0002")
         t = t.replace(/\u0001/g, D("**")).replace(/\u0002/g, D("*")).replace(/\u0003/g, D("~~"))
+        // rich text swallows a trailing newline, which made this layer one line shorter than the real input. a zero-width
+        // space after it keeps that last (empty) line alive so both layers always have the same height
+        if (/\n$/.test(t)) t += "\u200b"
         return "<div style=\"white-space:pre-wrap\">" + t + "</div>"
     }
     // ---- a card that grows out of a screen edge ----
@@ -2668,7 +2895,7 @@ Window {
         flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | (bar.sideTyping ? 0 : Qt.WindowDoesNotAcceptFocus)
         // while a note is being edited the panel ignores the mouse leaving; clicking somewhere else (the window
         // loses the keyboard) is what closes it. the short timer skips the focus flicker when the window flags change
-        onActiveChanged: if (!active && sidePanel.composing) outsideClick.restart()
+        onActiveChanged: if (!active && (sidePanel.composing || bar.sideTyping)) outsideClick.restart()
         Timer { id: outsideClick; interval: 220; onTriggered: if (!sideWin.active) bar.sideOutside() }
         width: bar.sideW                         // its right edge sits right on the frame's inner edge
         height: bar.sideH + 2 * bar.flare        // + room for the two concave joins above and below the card
@@ -2726,6 +2953,28 @@ Window {
                         return true
                     }
                     function focusInput(t) { bar.sideTyping = true; focusTarget = t; noteFocus.restart() }
+
+                    // ---- notes helpers ----
+                    property string noteQuery: ""
+                    function noteMatch(n) {
+                        var q = noteQuery.trim().toLowerCase()
+                        if (q === "") return true
+                        return bar.noteText((n.title || "") + " " + (n.t || "")).toLowerCase().indexOf(q) >= 0
+                    }
+                    readonly property int noteHits: {
+                        var c = 0
+                        var l = bar.notes
+                        for (var i = 0; i < l.length; i++) if (noteMatch(l[i])) c++
+                        return c
+                    }
+                    // pinning re-sorts the list, so an open editor has to follow its note to the new index
+                    function pinNote(i) {
+                        var ts = editIndex >= 0 ? bar.notes[editIndex].ts : -1
+                        bar.noteTogglePin(i)
+                        if (ts >= 0) for (var j = 0; j < bar.notes.length; j++) if (bar.notes[j].ts === ts) { editIndex = j; break }
+                    }
+                    function copyText(s) { clipHelper.text = s; clipHelper.selectAll(); clipHelper.copy() }
+                    TextEdit { id: clipHelper; visible: false; width: 10; height: 10 }
                     function newNote() {
                         titleEdit.text = ""
                         noteEdit.text = ""
@@ -2764,7 +3013,7 @@ Window {
                     Timer {
                         id: typingCheck
                         interval: 160
-                        onTriggered: if (!titleEdit.activeFocus && !noteEdit.activeFocus) { bar.sideTyping = false; sideCloseDelay.restart(); if (composing) bar.sideOutside() }
+                        onTriggered: if (!titleEdit.activeFocus && !noteEdit.activeFocus && !searchEdit.activeFocus) { bar.sideTyping = false; sideCloseDelay.restart(); if (composing) bar.sideOutside() }
                     }
 
                     MouseArea { anchors.fill: parent }
@@ -2974,13 +3223,53 @@ Window {
                             spacing: 10
 
                             // ---- the + button opens the editor ----
-                            ClkBtn {
+                            Row {
                                 visible: !sidePanel.composing
                                 width: parent.width
-                                text: "New note"
-                                icon: "\uE710"
-                                accent: bar.accent; fontFamily: bar.uiFont
-                                onClicked: sidePanel.newNote()
+                                spacing: 6
+                                ClkBtn {
+                                    width: 112
+                                    text: "New note"
+                                    icon: "\uE710"
+                                    accent: bar.accent; fontFamily: bar.uiFont
+                                    onClicked: sidePanel.newNote()
+                                }
+                                Rectangle {
+                                    width: parent.width - 112 - 6
+                                    height: 32
+                                    radius: 8
+                                    antialiasing: true
+                                    color: Qt.rgba(1, 1, 1, searchEdit.activeFocus ? 0.14 : 0.08)      // same flat look as the New note button next to it
+                                    Text { x: 10; anchors.verticalCenter: parent.verticalCenter; text: "\uE721"; font.family: "Segoe Fluent Icons"; font.pixelSize: 12; color: bar.muted }
+                                    TextInput {
+                                        id: searchEdit
+                                        anchors.fill: parent
+                                        anchors.leftMargin: 30
+                                        anchors.rightMargin: 28
+                                        verticalAlignment: TextInput.AlignVCenter
+                                        color: "white"
+                                        selectionColor: Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, 0.35)
+                                        cursorDelegate: Rectangle { width: 1.5; color: "white"; opacity: searchEdit.activeFocus ? 1 : 0 }
+                                        selectByMouse: true
+                                        clip: true
+                                        maximumLength: 60
+                                        font.family: bar.uiFont
+                                        font.pixelSize: 12
+                                        onTextChanged: sidePanel.noteQuery = text
+                                        onActiveFocusChanged: if (!activeFocus) typingCheck.restart()
+                                        Keys.onEscapePressed: { text = ""; focus = false }
+                                    }
+                                    Text { visible: searchEdit.text === ""; x: 30; anchors.verticalCenter: parent.verticalCenter; text: "Search notes"; color: Qt.rgba(1, 1, 1, 0.38); font.family: bar.uiFont; font.pixelSize: 12 }
+                                    // click the box to start typing
+                                    MouseArea { anchors.fill: parent; enabled: !searchEdit.activeFocus; cursorShape: Qt.IBeamCursor; onClicked: sidePanel.focusInput(searchEdit) }
+                                    // clear
+                                    Item {
+                                        visible: searchEdit.text !== ""
+                                        x: parent.width - 26; y: 0; width: 26; height: parent.height
+                                        Text { anchors.centerIn: parent; text: "\uE711"; font.family: "Segoe Fluent Icons"; font.pixelSize: 10; color: bar.muted }
+                                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: searchEdit.text = "" }
+                                    }
+                                }
                             }
 
                             // ---- editor (title + text + save), only while composing / editing ----
@@ -2997,9 +3286,17 @@ Window {
                                     radius: 10
                                     antialiasing: true
                                     color: Qt.rgba(0, 0, 0, 0.28)
-                                    border.width: 1
-                                    border.color: titleEdit.activeFocus ? bar.accent : Qt.rgba(1, 1, 1, 0.14)
-                                    Behavior on border.color { ColorAnimation { duration: 90 } }
+                                    // the outline is its own rectangle: a border on a see-through fill leaves a dark seam where the corner meets the straight edge
+                                    Rectangle {
+                                        z: 1
+                                        anchors.fill: parent
+                                        radius: parent.radius
+                                        antialiasing: true
+                                        color: "transparent"
+                                        border.width: 1
+                                        border.color: titleEdit.activeFocus ? bar.accent : Qt.rgba(1, 1, 1, 0.14)
+                                        Behavior on border.color { ColorAnimation { duration: 90 } }
+                                    }
                                     // live preview: the styled copy of the title, right in the box
                                     LiveLine { anchors.fill: parent; anchors.leftMargin: 12; anchors.rightMargin: 12; input: titleEdit }
                                     TextInput {
@@ -3047,15 +3344,23 @@ Window {
                                     radius: 10
                                     antialiasing: true
                                     color: Qt.rgba(0, 0, 0, 0.28)
-                                    border.width: 1
-                                    border.color: noteEdit.activeFocus ? bar.accent : Qt.rgba(1, 1, 1, 0.14)
-                                    Behavior on border.color { ColorAnimation { duration: 90 } }
+                                    // the outline is its own rectangle: a border on a see-through fill leaves a dark seam where the corner meets the straight edge
+                                    Rectangle {
+                                        z: 1
+                                        anchors.fill: parent
+                                        radius: parent.radius
+                                        antialiasing: true
+                                        color: "transparent"
+                                        border.width: 1
+                                        border.color: noteEdit.activeFocus ? bar.accent : Qt.rgba(1, 1, 1, 0.14)
+                                        Behavior on border.color { ColorAnimation { duration: 90 } }
+                                    }
                                     Flickable {
                                         id: noteFlick
                                         anchors.fill: parent
                                         anchors.margins: 10
                                         contentWidth: width
-                                        contentHeight: Math.max(noteEdit.contentHeight, liveNote.contentHeight)
+                                        contentHeight: noteEdit.contentHeight
                                         clip: true
                                         boundsBehavior: Flickable.StopAtBounds
                                         function clampY() {
@@ -3068,17 +3373,23 @@ Window {
                                             else if (contentY + height <= r.y + r.height) contentY = r.y + r.height - height
                                             clampY()
                                         }
+                                        // runs one event-loop turn later, when the TextEdit has finished re-laying out after a big delete,
+                                        // so it never scrolls to a stale cursor rectangle
+                                        function followCursor() {
+                                            clampY()
+                                            if (noteEdit.activeFocus) ensureVisible(noteEdit.cursorRectangle)
+                                        }
                                         // deleting a lot of text leaves the old scroll offset behind: the leftover text slides out of the box
                                         // (still there, but you can't reach it). pull the view back whenever the text gets shorter
                                         onContentHeightChanged: clampY()
                                         onHeightChanged: clampY()
                                         // live preview: the styled copy of the text, right in the box
-                                        LiveText { id: liveNote; src: noteEdit; width: noteEdit.width; wrapMode: Text.Wrap }
+                                        LiveText { id: liveNote; src: noteEdit; width: noteEdit.width; wrapMode: Text.WrapAtWordBoundaryOrAnywhere }
                                         TextEdit {
                                             id: noteEdit
                                             width: noteFlick.width
                                             height: Math.max(contentHeight, noteFlick.height)
-                                            wrapMode: TextEdit.Wrap
+                                            wrapMode: TextEdit.WrapAtWordBoundaryOrAnywhere
                                             color: "transparent"
                                             selectedTextColor: "transparent"
                                             selectionColor: Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, 0.35)
@@ -3086,7 +3397,8 @@ Window {
                                             selectByMouse: true
                                             font.family: bar.uiFont
                                             font.pixelSize: 12
-                                            onCursorRectangleChanged: noteFlick.ensureVisible(cursorRectangle)
+                                            onCursorRectangleChanged: Qt.callLater(noteFlick.followCursor)
+                                            onTextChanged: Qt.callLater(noteFlick.followCursor)
                                             onActiveFocusChanged: if (!activeFocus) typingCheck.restart()
                                             Keys.onPressed: (e) => {
                                                 if (sidePanel.autoClose(noteEdit, e)) { e.accepted = true; return }
@@ -3141,9 +3453,9 @@ Window {
                                 height: sidePanel.bodyH - 10 - (sidePanel.composing ? composer.implicitHeight : 32)
                                 clip: true
                                 Text {
-                                    visible: bar.notes.length === 0
+                                    visible: sidePanel.noteHits === 0
                                     anchors.centerIn: parent
-                                    text: "No notes yet"
+                                    text: bar.notes.length === 0 ? "No notes yet" : "No matches"
                                     color: bar.muted
                                     font.family: bar.uiFont
                                     font.pixelSize: 12
@@ -3169,6 +3481,12 @@ Window {
                                                 readonly property string title: modelData.title || ""
                                                 readonly property string body: modelData.t || ""
                                                 property bool expanded: false
+                                                property bool copied: false
+                                                property bool armDel: false              // first click on the bin arms it, the second one deletes
+                                                readonly property bool pinned: modelData.pin === true
+                                                visible: sidePanel.noteMatch(modelData)
+                                                Timer { id: copyT; interval: 1200; onTriggered: nrow.copied = false }
+                                                Timer { id: armT; interval: 2200; onTriggered: nrow.armDel = false }
                                                 // a note with a title is folded down to just its title until you click it
                                                 readonly property bool showBody: nrow.body !== "" && (nrow.title === "" || nrow.expanded)
                                                 width: noteCol.width
@@ -3182,11 +3500,13 @@ Window {
                                                 Behavior on color { ColorAnimation { duration: 90 } }
                                                 Behavior on height { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
                                                 MouseArea { id: nrowMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: nrow.expanded = !nrow.expanded }
+                                                // pinned notes get an accent bar on the left
+                                                Rectangle { visible: nrow.pinned; x: 0; y: 6; width: 3; height: parent.height - 12; radius: 1.5; color: bar.accent }
                                                 Column {
                                                     id: ncol
                                                     x: 12
                                                     y: 8
-                                                    width: parent.width - 12 - 66
+                                                    width: parent.width - 12 - 114
                                                     spacing: 3
                                                     Text {
                                                         visible: nrow.title !== ""
@@ -3219,6 +3539,34 @@ Window {
                                                     }
                                                 }
                                                 Rectangle {
+                                                    x: parent.width - 106
+                                                    y: 6
+                                                    width: 22
+                                                    height: 22
+                                                    radius: 6
+                                                    antialiasing: true
+                                                    color: nrow.pinned ? Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, 0.35) : Qt.rgba(1, 1, 1, npinMouse.containsMouse ? 0.16 : 0.08)
+                                                    Text { anchors.centerIn: parent; text: nrow.pinned ? "\uE842" : "\uE718"; font.family: "Segoe Fluent Icons"; font.pixelSize: 11; color: nrow.pinned ? bar.accent : "white" }
+                                                    MouseArea { id: npinMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: sidePanel.pinNote(nrow.index) }
+                                                }
+                                                Rectangle {
+                                                    x: parent.width - 80
+                                                    y: 6
+                                                    width: 22
+                                                    height: 22
+                                                    radius: 6
+                                                    antialiasing: true
+                                                    color: Qt.rgba(1, 1, 1, ncopyMouse.containsMouse ? 0.16 : 0.08)
+                                                    Text { anchors.centerIn: parent; text: nrow.copied ? "\uE73E" : "\uE8C8"; font.family: "Segoe Fluent Icons"; font.pixelSize: 11; color: nrow.copied ? "#7be08f" : "white" }
+                                                    MouseArea {
+                                                        id: ncopyMouse
+                                                        anchors.fill: parent
+                                                        hoverEnabled: true
+                                                        cursorShape: Qt.PointingHandCursor
+                                                        onClicked: { sidePanel.copyText(nrow.title !== "" ? nrow.title + "\n" + nrow.body : nrow.body); nrow.copied = true; copyT.restart() }
+                                                    }
+                                                }
+                                                Rectangle {
                                                     x: parent.width - 54
                                                     y: 6
                                                     width: 22
@@ -3236,14 +3584,15 @@ Window {
                                                     height: 22
                                                     radius: 6
                                                     antialiasing: true
-                                                    color: Qt.rgba(1, 1, 1, ndelMouse.containsMouse ? 0.16 : 0.08)
-                                                    Text { anchors.centerIn: parent; text: "\uE74D"; font.family: "Segoe Fluent Icons"; font.pixelSize: 11; color: "#ff6b7a" }
+                                                    color: nrow.armDel ? "#ff6b7a" : Qt.rgba(1, 1, 1, ndelMouse.containsMouse ? 0.16 : 0.08)
+                                                    Text { anchors.centerIn: parent; text: nrow.armDel ? "\uE73E" : "\uE74D"; font.family: "Segoe Fluent Icons"; font.pixelSize: 11; color: nrow.armDel ? "#000000" : "#ff6b7a" }
                                                     MouseArea {
                                                         id: ndelMouse
                                                         anchors.fill: parent
                                                         hoverEnabled: true
                                                         cursorShape: Qt.PointingHandCursor
                                                         onClicked: {
+                                                            if (!nrow.armDel) { nrow.armDel = true; armT.restart(); return }
                                                             if (sidePanel.editIndex === nrow.index) sidePanel.closeComposer()
                                                             else if (sidePanel.editIndex > nrow.index) sidePanel.editIndex--
                                                             bar.noteDelete(nrow.index)
@@ -3388,6 +3737,7 @@ Window {
     readonly property int dockH: 460
     readonly property int dockSeam: 2      // the dock window reaches this many px into the bottom frame so the card covers the frame's hairline
     property string dockTab: "dash"       // dash | media | ws
+    onDockPChanged: if (dockP <= 0.002 && dockTab !== "dash") dockTab = "dash"     // folded away: next time it opens on the dashboard
     readonly property real dockPv: Math.min(1, Math.max(0, dockP))
     readonly property real dockWinW: dockW + 2 * flare
     readonly property real dockCwidNow: dockPv * dockW
@@ -3471,12 +3821,14 @@ Window {
                     // calendar state: opens on the current month
                 property int calYear: new Date().getFullYear()
                 property int calMonth: new Date().getMonth()
+                property int calDir: 0                  // -1 / 1 = which way the month grid slides in, 0 = just fades
                 function cellDate(i) {
                     var first = new Date(calYear, calMonth, 1)
                     var off = (first.getDay() + 6) % 7            // weeks start on Monday
                     return new Date(calYear, calMonth, 1 - off + i)
                 }
                 function calStep(n) {
+                    calDir = n
                     var d = new Date(calYear, calMonth + n, 1)
                     calYear = d.getFullYear()
                     calMonth = d.getMonth()
@@ -3484,7 +3836,7 @@ Window {
                 Connections {
                     target: bar
                     function onDockShowChanged() {
-                        if (bar.dockShow) { dockPanel.calYear = new Date().getFullYear(); dockPanel.calMonth = new Date().getMonth() }
+                        if (bar.dockShow) { bar.dockTab = "dash"; dockPanel.calYear = new Date().getFullYear(); dockPanel.calMonth = new Date().getMonth() }
                     }
                 }
 
@@ -3494,6 +3846,7 @@ Window {
                     x: 18; y: 10
                     width: parent.width - 36
                     height: 46
+                    readonly property int cur: bar.dockTab === "dash" ? 0 : (bar.dockTab === "media" ? 1 : 2)
                     Repeater {
                         model: [ { key: "dash", icon: "\uE80F", label: "Dashboard" },
                                  { key: "media", icon: "\uE8D6", label: "Media" },
@@ -3510,25 +3863,41 @@ Window {
                                 anchors.horizontalCenter: parent.horizontalCenter
                                 y: 3
                                 spacing: 3
-                                Text { anchors.horizontalCenter: parent.horizontalCenter; text: tab.modelData.icon; font.family: "Segoe Fluent Icons"; font.pixelSize: 16; color: tab.on ? "white" : bar.muted }
-                                Text { anchors.horizontalCenter: parent.horizontalCenter; text: tab.modelData.label; font.family: bar.uiFont; font.pixelSize: 12; color: tab.on ? "white" : bar.muted }
+                                scale: tabMouse.pressed ? 0.94 : (tabMouse.containsMouse ? 1.06 : 1)
+                                Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    text: tab.modelData.icon; font.family: "Segoe Fluent Icons"; font.pixelSize: 16
+                                    color: tab.on ? bar.accent : (tabMouse.containsMouse ? "white" : bar.muted)
+                                    Behavior on color { ColorAnimation { duration: 180 } }
+                                }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    text: tab.modelData.label; font.family: bar.uiFont; font.pixelSize: 12
+                                    color: tab.on ? "white" : (tabMouse.containsMouse ? "white" : bar.muted)
+                                    Behavior on color { ColorAnimation { duration: 180 } }
+                                }
                             }
-                            Rectangle {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                anchors.bottom: parent.bottom
-                                width: tab.on ? 84 : 0
-                                height: 2
-                                radius: 1
-                                color: bar.accent
-                                Behavior on width { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
-                            }
-                            MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bar.dockTab = tab.modelData.key }
+                            MouseArea { id: tabMouse; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: bar.dockTab = tab.modelData.key }
                         }
+                    }
+                    // one accent line that glides between the tabs
+                    Rectangle {
+                        anchors.bottom: parent.bottom
+                        width: 84
+                        height: 2
+                        radius: 1
+                        color: bar.accent
+                        x: dockTabs.cur * (dockTabs.width / 3) + (dockTabs.width / 3 - width) / 2
+                        Behavior on x { NumberAnimation { duration: 380; easing.type: Easing.OutBack; easing.overshoot: 0.9 } }
                     }
                 }
                 Rectangle { x: 18; y: 57; width: parent.width - 36; height: 1; color: Qt.rgba(1, 1, 1, 0.12) }
 
                 // ---- dashboard ----
+                // layout (724 x 374):   hero (profile + clock) | music strip
+                //                                              | calendar | weather
+                //                                              |          | notes / reminders
                 Item {
                     id: dashPage
                     visible: bar.dockTab === "dash"
@@ -3536,104 +3905,328 @@ Window {
                     width: parent.width - 36
                     height: parent.height - 68 - 18
 
-                    // ---- weather ----
-                    Rectangle {
-                        x: 0; y: 0; width: 220; height: 100
-                        radius: 18; antialiasing: true
-                        color: Qt.rgba(1, 1, 1, 0.06)
-                        readonly property var info: bar.weatherInfo(bar.wCode)
-                        readonly property string deg: bar.weatherF ? "\u00B0F" : "\u00B0C"
-                        Text { visible: !bar.weatherOk; anchors.centerIn: parent; text: "Loading weather..."; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
+                    // enter: 0 -> 1 every time the dashboard shows up, the tiles glide in one after the other.
+                    // phase: one shared clock looping 0 -> 1 every 6 s, the idle animations are functions of it.
+                    property real enter: 0
+                    property real phase: 0
+                    readonly property real tau: 2 * Math.PI
+                    readonly property bool live: bar.dockShow && bar.dockTab === "dash"
+                    onLiveChanged: { B.statsWatch(live); enterAnim.stop(); if (live) { enter = 0; enterAnim.start() } }
+                    NumberAnimation { id: enterAnim; target: dashPage; property: "enter"; from: 0; to: 1; duration: 1000 }
+                    NumberAnimation { target: dashPage; property: "phase"; from: 0; to: 1; duration: 6000; loops: Animation.Infinite; running: dashPage.live }
+                    function ease(t) { t = Math.max(0, Math.min(1, t)); return 1 - Math.pow(1 - t, 3) }
+
+                    // ================= HERO: profile + clock =================
+                    DashCard {
+                        id: hero
+                        enter: dashPage.enter; order: 0
+                        x: 0; y: 0; width: 236; height: parent.height
+                        radius: 24
+                        readonly property string greeting: {
+                            var h = bar.now.getHours()
+                            return (h < 5 || h >= 21) ? "Good night" : (h < 12 ? "Good morning" : (h < 18 ? "Good afternoon" : "Good evening"))
+                        }
+                        readonly property real typed: dashPage.ease((dashPage.enter - 0.12) / 0.4)
+                        // picture with rings and a comet
                         Item {
-                            visible: bar.weatherOk
-                            anchors.fill: parent
-                            Text { x: 14; y: 16; text: parent.parent.info[0]; font.family: "Segoe UI Emoji"; font.pixelSize: 40 }
-                            Text { x: 76; y: 12; text: Math.round(bar.wTemp) + parent.parent.deg; color: "white"; font.family: bar.uiFont; font.pixelSize: 28; font.weight: Font.Bold }
-                            Text { x: 76; y: 50; text: parent.parent.info[1]; color: "white"; font.family: bar.uiFont; font.pixelSize: 12 }
-                            Text { x: 14; y: 76; text: "Feels " + Math.round(bar.wFeels) + "\u00B0   H " + Math.round(bar.wHi) + "\u00B0  L " + Math.round(bar.wLo) + "\u00B0"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
-                        }
-                    }
-
-                    // ---- profile ----
-                    Rectangle {
-                        id: profileCard
-                        x: 228; y: 0; width: 280; height: 100
-                        radius: 18; antialiasing: true
-                        color: Qt.rgba(1, 1, 1, 0.06)
-
-                        // avatar: round picture with an accent ring (the glyph shows if the picture is missing)
-                        Rectangle {
-                            x: 14
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: 68; height: 68; radius: 34
-                            antialiasing: true
-                            color: Qt.rgba(1, 1, 1, 0.08)
-                            border.width: 2
-                            border.color: bar.accent
-                            Text { anchors.centerIn: parent; text: bar.profileIcon; font.family: "Segoe Fluent Icons"; font.pixelSize: 28; color: Qt.rgba(1, 1, 1, 0.3) }
-                            RoundImage { anchors.fill: parent; anchors.margins: 3; radius: width / 2; cover: true; source: bar.profilePic }
-                        }
-
-                        Column {
-                            x: 98
-                            anchors.verticalCenter: parent.verticalCenter
-                            width: parent.width - 98 - 12
-                            spacing: 9
-                            ProfileRow { width: parent.width; glyph: bar.profileIcon;    label: bar.profileName }
-                            ProfileRow { width: parent.width; glyph: bar.profileSubIcon; label: bar.profileSub }
-                            ProfileRow { width: parent.width; glyph: "\uE916";           label: bar.uptimeText }
-                        }
-                    }
-
-                    // ---- time ----
-                    Rectangle {
-                        x: 0; y: 108; width: 104; height: parent.height - 108
-                        radius: 18; antialiasing: true
-                        color: Qt.rgba(1, 1, 1, 0.06)
-                        Column {
-                            anchors.centerIn: parent
-                            spacing: 6
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: Qt.formatDateTime(bar.now, "hh AP").substring(0, 2); color: "white"; font.family: bar.uiFont; font.pixelSize: 34; font.weight: Font.Bold }
-                            Row {
-                                anchors.horizontalCenter: parent.horizontalCenter
-                                spacing: 4
-                                Repeater { model: 3; Rectangle { width: 5; height: 5; radius: 2.5; color: bar.accent } }
+                            id: avatarBox
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: 8
+                            width: 140; height: 140
+                            Rectangle {      // outer hairline ring
+                                anchors.centerIn: parent
+                                width: 132; height: 132; radius: 66
+                                color: "transparent"; antialiasing: true
+                                border.width: 1; border.color: Qt.rgba(1, 1, 1, 0.12)
                             }
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: Qt.formatDateTime(bar.now, "mm"); color: "white"; font.family: bar.uiFont; font.pixelSize: 34; font.weight: Font.Bold }
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; text: Qt.formatDateTime(bar.now, "AP"); color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
-                            Text { anchors.horizontalCenter: parent.horizontalCenter; topPadding: 8; text: Qt.formatDateTime(bar.now, "ddd, d"); color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
+                            Rectangle {      // breathing accent ring
+                                readonly property real w: 0.5 + 0.5 * Math.sin(dashPage.phase * dashPage.tau * 2)
+                                anchors.centerIn: parent
+                                width: 112; height: 112; radius: 56
+                                color: "transparent"; antialiasing: true
+                                border.width: 2; border.color: bar.accent
+                                opacity: 0.15 + 0.3 * w
+                                scale: 0.97 + 0.06 * w
+                            }
+                            Item {           // comet: 28 dots circling, the tail fades out
+                                anchors.centerIn: parent
+                                width: 0; height: 0
+                                rotation: dashPage.phase * 360
+                                Repeater {
+                                    model: 28
+                                    Item {
+                                        id: cd
+                                        required property int index
+                                        readonly property real f: index / 27
+                                        rotation: index * (360 / 28)
+                                        Rectangle {
+                                            readonly property real sz: 2 + 3.5 * cd.f
+                                            x: -sz / 2
+                                            y: -56 - sz / 2
+                                            width: sz; height: sz; radius: sz / 2
+                                            antialiasing: true
+                                            color: bar.mix(bar.accent, bar.lavender, cd.f)
+                                            opacity: 0.04 + 0.96 * cd.f * cd.f
+                                        }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                id: av
+                                anchors.centerIn: parent
+                                width: 84; height: 84; radius: 42
+                                antialiasing: true
+                                color: Qt.rgba(1, 1, 1, 0.08)
+                                border.width: 2
+                                border.color: bar.accent
+                                scale: avHover.hovered ? 1.08 : 1
+                                Behavior on scale { SpringAnimation { spring: 4; damping: 0.3; epsilon: 0.005 } }
+                                HoverHandler { id: avHover; cursorShape: Qt.PointingHandCursor }
+                                Text { anchors.centerIn: parent; text: bar.profileIcon; font.family: "Segoe Fluent Icons"; font.pixelSize: 30; color: Qt.rgba(1, 1, 1, 0.3) }
+                                RoundImage { anchors.fill: parent; anchors.margins: 3; radius: width / 2; cover: true; source: bar.profilePic }
+                            }
+                        }
+
+                        Text {
+                            x: 0; y: 152; width: parent.width
+                            horizontalAlignment: Text.AlignHCenter
+                            text: hero.greeting
+                            color: bar.accent
+                            font.family: bar.uiFont; font.pixelSize: 11; font.weight: Font.DemiBold
+                            font.letterSpacing: 1.5
+                        }
+                        Text {
+                            x: 12; y: 166; width: parent.width - 24; height: 30
+                            horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                            text: bar.profileName.substring(0, Math.round(bar.profileName.length * hero.typed))
+                            color: "white"
+                            font.family: bar.uiFont; font.pixelSize: 23; font.weight: Font.Bold
+                            elide: Text.ElideRight
+                        }
+                        // two little pills: the sub line + uptime
+                        Column {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: 202
+                            spacing: 5
+                            Repeater {
+                                model: [ { g: bar.profileSubIcon, t: bar.profileSub }, { g: "\uE916", t: bar.uptimeText } ]
+                                Rectangle {
+                                    required property var modelData
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    width: Math.min(hero.width - 28, pillRow.implicitWidth + 22)
+                                    height: 22; radius: 11
+                                    antialiasing: true
+                                    color: "transparent"
+                                    Row {
+                                        id: pillRow
+                                        anchors.centerIn: parent
+                                        spacing: 6
+                                        Text { anchors.verticalCenter: parent.verticalCenter; text: modelData.g; font.family: "Segoe Fluent Icons"; font.pixelSize: 12; color: bar.accent }
+                                        Text { anchors.verticalCenter: parent.verticalCenter; text: modelData.t; color: "white"; font.family: bar.uiFont; font.pixelSize: 11; font.weight: Font.DemiBold }
+                                    }
+                                }
+                            }
+                        }
+
+                        // big clock
+                        Row {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            y: 276
+                            spacing: 0
+                            Text {
+                                id: hhText
+                                text: Qt.formatDateTime(bar.now, "hh AP").substring(0, 2)
+                                color: "white"; font.family: bar.uiFont; font.pixelSize: 40; font.weight: Font.Bold
+                                onTextChanged: hhPop.restart()
+                                NumberAnimation { id: hhPop; target: hhText; property: "scale"; from: 1.2; to: 1; duration: 420; easing.type: Easing.OutBack }
+                            }
+                            Text {
+                                text: ":"
+                                color: bar.accent; font.family: bar.uiFont; font.pixelSize: 40; font.weight: Font.Bold
+                                opacity: 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(dashPage.phase * dashPage.tau * 6))
+                            }
+                            Text {
+                                id: mmText
+                                text: Qt.formatDateTime(bar.now, "mm")
+                                color: "white"; font.family: bar.uiFont; font.pixelSize: 40; font.weight: Font.Bold
+                                onTextChanged: mmPop.restart()
+                                NumberAnimation { id: mmPop; target: mmText; property: "scale"; from: 1.2; to: 1; duration: 420; easing.type: Easing.OutBack }
+                            }
+                            Text {
+                                anchors.baseline: mmText.baseline
+                                leftPadding: 6
+                                text: Qt.formatDateTime(bar.now, "AP")
+                                color: bar.muted; font.family: bar.uiFont; font.pixelSize: 13; font.weight: Font.DemiBold
+                            }
+                        }
+                        Text {
+                            x: 0; y: 322; width: parent.width
+                            horizontalAlignment: Text.AlignHCenter
+                            text: Qt.formatDate(bar.now, "dddd, d MMMM")
+                            color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12
                         }
                     }
 
-                    // ---- calendar ----
-                    Rectangle {
-                        id: calCard
-                        x: 112; y: 108; width: 396; height: parent.height - 108
-                        radius: 18; antialiasing: true
-                        color: Qt.rgba(1, 1, 1, 0.06)
+                    // ================= MUSIC STRIP: ring visualizer + controls =================
+                    DashCard {
+                        id: musicCard
+                        enter: dashPage.enter; order: 1
+                        x: 244; y: 0; width: parent.width - 244; height: 150
+                        radius: 24
+                        readonly property bool has: B.mediaTitle !== ""
+                        readonly property real bass: (B.vizActive && B.vizBars.length > 0) ? B.vizBars[0] : 0
+                        property real trackIn: 1
+                        NumberAnimation { id: trackAnim; target: musicCard; property: "trackIn"; from: 0; to: 1; duration: 460; easing.type: Easing.OutCubic }
+                        MediaWheel { }       // scroll anywhere on the strip: previous / next playing app
+
+                        // the ring (same spokes as the Media tab, smaller)
                         Item {
-                            x: 16; y: 10
-                            width: parent.width - 32
-                            height: 34
-                            ClkBtn { x: 0; anchors.verticalCenter: parent.verticalCenter; width: 32; height: 28; icon: "\uE76B"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: dockPanel.calStep(-1) }
+                            id: miniRing
+                            x: 8; y: 0
+                            width: 150; height: 150
+                            Repeater {
+                                model: 36
+                                Item {
+                                    id: mspoke
+                                    required property int index
+                                    x: miniRing.width / 2
+                                    y: miniRing.height / 2
+                                    rotation: index * 10
+                                    readonly property int k: index <= 18 ? index : 36 - index
+                                    readonly property int band: Math.min(5, Math.floor(k / 3.2))
+                                    readonly property real v: (B.vizActive && B.vizBars.length > band ? B.vizBars[band] : 0) * (0.72 + 0.28 * Math.sin(index * 1.9))
+                                    Rectangle {
+                                        x: -1.75
+                                        y: -(48 + height)
+                                        width: 3.5
+                                        height: 4 + mspoke.v * 22
+                                        radius: 1.75
+                                        antialiasing: true
+                                        color: bar.mix(bar.accent, bar.lavender, mspoke.k / 18)
+                                        Behavior on height { NumberAnimation { duration: 70 } }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                anchors.centerIn: parent
+                                width: 86; height: 86; radius: 43
+                                antialiasing: true
+                                color: Qt.rgba(1, 1, 1, 0.08)
+                                // slow vinyl spin, pauses (keeps its angle) when the music stops
+                                NumberAnimation on rotation { from: 0; to: 360; duration: 24000; loops: Animation.Infinite; running: true; paused: !(B.mediaPlaying && dashPage.live) }
+                                Text { anchors.centerIn: parent; text: "\uE8D6"; font.family: "Segoe Fluent Icons"; font.pixelSize: 30; color: Qt.rgba(1, 1, 1, 0.3) }
+                                RoundImage { anchors.fill: parent; radius: width / 2; cover: true; source: B.mediaArt }
+                            }
+                        }
+
+                        // nothing playing
+                        Text {
+                            visible: !musicCard.has
+                            x: 172; anchors.verticalCenter: parent.verticalCenter
+                            text: "Nothing playing"
+                            color: bar.muted; font.family: bar.uiFont; font.pixelSize: 14
+                            opacity: 0.5 + 0.5 * (0.5 + 0.5 * Math.sin(dashPage.phase * dashPage.tau * 2))
+                        }
+
+                        // title / artist / source: slide in again whenever the track changes
+                        Item {
+                            visible: musicCard.has
+                            x: 172; y: 22
+                            width: parent.width - 172 - 18; height: 62
+                            opacity: musicCard.trackIn
+                            transform: Translate { x: (1 - musicCard.trackIn) * 14 }
+                            Text {
+                                width: parent.width; elide: Text.ElideRight
+                                text: B.mediaTitle
+                                color: "white"; font.family: bar.uiFont; font.pixelSize: 17; font.weight: Font.Bold
+                                onTextChanged: trackAnim.restart()
+                            }
+                            Text { y: 26; width: parent.width; elide: Text.ElideRight; text: B.mediaArtist; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 13 }
+                            Text { y: 46; width: parent.width; elide: Text.ElideRight; text: B.mediaSource; color: Qt.rgba(1, 1, 1, 0.4); font.family: bar.uiFont; font.pixelSize: 10 }
+                        }
+                        Row {
+                            visible: musicCard.has
+                            x: 172; y: 92
+                            spacing: 8
+                            ClkBtn { width: 36; height: 32; icon: "\uE892"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPrev() }
+                            ClkBtn { width: 48; height: 32; icon: B.mediaPlaying ? "\uE769" : "\uE768"; primary: true; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPlayPause() }
+                            ClkBtn { width: 36; height: 32; icon: "\uE893"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaNext() }
+                        }
+                        Text {
+                            visible: musicCard.has
+                            anchors.right: parent.right; anchors.rightMargin: 18
+                            y: 100
+                            text: B.mediaTime
+                            color: bar.muted; font.family: bar.uiFont; font.pixelSize: 11
+                        }
+                        // progress: grows on hover, smooth fill, knob
+                        Rectangle {
+                            visible: musicCard.has
+                            x: 172; y: 134 - (progMouse.containsMouse ? 1.5 : 0)
+                            width: parent.width - 172 - 18
+                            height: progMouse.containsMouse ? 8 : 5
+                            radius: height / 2
+                            color: Qt.rgba(1, 1, 1, 0.12)
+                            Behavior on height { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+                            Rectangle {
+                                height: parent.height; radius: parent.radius
+                                width: parent.width * Math.max(0, Math.min(1, B.mediaProgress))
+                                Behavior on width { NumberAnimation { duration: 450; easing.type: Easing.OutCubic } }
+                                color: bar.accent
+                                Rectangle {
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: parent.width - width / 2
+                                    width: progMouse.containsMouse ? 12 : 0
+                                    height: width; radius: width / 2
+                                    antialiasing: true
+                                    color: "white"
+                                    Behavior on width { NumberAnimation { duration: 140; easing.type: Easing.OutBack } }
+                                }
+                            }
+                            MouseArea {
+                                id: progMouse
+                                anchors.fill: parent; anchors.topMargin: -8; anchors.bottomMargin: -8
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: (m) => B.mediaSeek(Math.max(0, Math.min(1, m.x / width)))
+                            }
+                        }
+                    }
+
+                    // ================= CALENDAR =================
+                    DashCard {
+                        id: calCard
+                        enter: dashPage.enter; order: 2
+                        x: 244; y: 158; width: 250; height: parent.height - 158
+                        radius: 24
+                        property real gridIn: 1
+                        NumberAnimation { id: gridAnim; target: calCard; property: "gridIn"; from: 0; to: 1; duration: 340; easing.type: Easing.OutCubic }
+                        Connections { target: dockPanel; function onCalMonthChanged() { gridAnim.restart() } }
+                        Item {
+                            x: 12; y: 8
+                            width: parent.width - 24
+                            height: 30
+                            ClkBtn { x: 0; anchors.verticalCenter: parent.verticalCenter; width: 28; height: 26; icon: "\uE76B"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: dockPanel.calStep(-1) }
                             Text {
                                 anchors.centerIn: parent
                                 text: Qt.locale().monthName(dockPanel.calMonth) + " " + dockPanel.calYear
-                                color: "white"; font.family: bar.uiFont; font.pixelSize: 14; font.weight: Font.Bold
-                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { dockPanel.calYear = new Date().getFullYear(); dockPanel.calMonth = new Date().getMonth() } }
+                                color: "white"; font.family: bar.uiFont; font.pixelSize: 13; font.weight: Font.Bold
+                                MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: { dockPanel.calDir = 0; dockPanel.calYear = new Date().getFullYear(); dockPanel.calMonth = new Date().getMonth() } }
                             }
-                            ClkBtn { x: parent.width - 32; anchors.verticalCenter: parent.verticalCenter; width: 32; height: 28; icon: "\uE76C"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: dockPanel.calStep(1) }
+                            ClkBtn { x: parent.width - 28; anchors.verticalCenter: parent.verticalCenter; width: 28; height: 26; icon: "\uE76C"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: dockPanel.calStep(1) }
                         }
                         Row {
-                            x: 16; y: 48
+                            x: 12; y: 40
                             Repeater {
-                                model: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-                                Text { required property string modelData; width: (calCard.width - 32) / 7; horizontalAlignment: Text.AlignHCenter; text: modelData; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 11; font.weight: Font.DemiBold }
+                                model: ["M", "T", "W", "T", "F", "S", "S"]
+                                Text { required property string modelData; required property int index; width: (calCard.width - 24) / 7; horizontalAlignment: Text.AlignHCenter; text: modelData; color: index >= 5 ? bar.accent : bar.muted; font.family: bar.uiFont; font.pixelSize: 10; font.weight: Font.DemiBold }
                             }
                         }
                         Grid {
-                            x: 16; y: 72
+                            x: 12; y: 58
                             columns: 7
+                            opacity: calCard.gridIn
+                            transform: Translate { x: (1 - calCard.gridIn) * dockPanel.calDir * 30 }
                             Repeater {
                                 model: 42
                                 Item {
@@ -3642,9 +4235,11 @@ Window {
                                     readonly property var d: dockPanel.cellDate(index)
                                     readonly property bool cur: d.getMonth() === dockPanel.calMonth
                                     readonly property bool today: d.getDate() === bar.now.getDate() && d.getMonth() === bar.now.getMonth() && d.getFullYear() === bar.now.getFullYear()
-                                    width: (calCard.width - 32) / 7
-                                    height: (calCard.height - 72 - 10) / 6
+                                    readonly property bool weekend: index % 7 >= 5
+                                    width: (calCard.width - 24) / 7
+                                    height: (calCard.height - 58 - 8) / 6
                                     Rectangle {
+                                        id: cellBg
                                         anchors.centerIn: parent
                                         width: Math.min(parent.width, parent.height) - 2
                                         height: width
@@ -3652,57 +4247,81 @@ Window {
                                         antialiasing: true
                                         color: cell.today ? bar.accent : "transparent"
                                     }
+                                    Rectangle {
+                                        visible: cell.today
+                                        readonly property real pp: cell.today ? (dashPage.phase * 3) % 1 : 0
+                                        anchors.centerIn: parent
+                                        width: cellBg.width; height: width; radius: width / 2
+                                        antialiasing: true
+                                        color: "transparent"
+                                        border.width: 2; border.color: bar.accent
+                                        scale: 1 + 0.55 * pp
+                                        opacity: 0.55 * (1 - pp)
+                                    }
                                     Text {
                                         anchors.centerIn: parent
                                         text: cell.d.getDate()
                                         font.family: bar.uiFont
-                                        font.pixelSize: 13
+                                        font.pixelSize: 12
                                         font.weight: cell.today ? Font.Bold : Font.Normal
-                                        color: cell.today ? ((0.299 * bar.accent.r + 0.587 * bar.accent.g + 0.114 * bar.accent.b) > 0.55 ? "#000000" : "#ffffff") : (cell.cur ? "white" : Qt.rgba(1, 1, 1, 0.28))
+                                        color: cell.today ? ((0.299 * bar.accent.r + 0.587 * bar.accent.g + 0.114 * bar.accent.b) > 0.55 ? "#000000" : "#ffffff")
+                                                          : (cell.cur ? (cell.weekend ? bar.mix(Qt.rgba(1, 1, 1, 1), bar.accent, 0.45) : "white") : Qt.rgba(1, 1, 1, 0.28))
                                     }
                                 }
                             }
                         }
                     }
 
-                    // ---- music ----
-                    Rectangle {
-                        id: musicCard
-                        x: 516; y: 0; width: parent.width - 516; height: parent.height
-                        radius: 18; antialiasing: true
-                        color: Qt.rgba(1, 1, 1, 0.06)
-                        readonly property bool has: B.mediaTitle !== ""
-                        MediaWheel { }          // scroll anywhere on the card: previous / next playing app
-                        Text { visible: !musicCard.has; anchors.centerIn: parent; text: "Nothing playing"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
+                    // ================= WEATHER =================
+                    DashCard {
+                        id: weatherCard
+                        x: 502; y: 158; width: parent.width - 502; height: 100
+                        radius: 24
+                        readonly property var info: bar.weatherInfo(bar.wCode)
+                        readonly property string deg: bar.weatherF ? "\u00B0F" : "\u00B0C"
+                        Text { visible: !bar.weatherOk; anchors.centerIn: parent; text: "Loading weather..."; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
                         Item {
-                            visible: musicCard.has
+                            visible: bar.weatherOk
                             anchors.fill: parent
-                            Rectangle {
-                                x: (parent.width - 150) / 2; y: 20
-                                width: 150; height: 150; radius: 75
-                                antialiasing: true
-                                color: Qt.rgba(1, 1, 1, 0.08)
-                                Text { anchors.centerIn: parent; text: "\uE8D6"; font.family: "Segoe Fluent Icons"; font.pixelSize: 36; color: Qt.rgba(1, 1, 1, 0.3) }
-                                RoundImage { anchors.fill: parent; radius: width / 2; cover: true; source: B.mediaArt }
+                            Text {
+                                x: 12
+                                y: 8
+                                text: weatherCard.info[0]; font.family: "Segoe UI Emoji"; font.pixelSize: 36
                             }
-                            Text { x: 12; y: 186; width: parent.width - 24; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight; text: B.mediaTitle; color: "white"; font.family: bar.uiFont; font.pixelSize: 14; font.weight: Font.Bold }
-                            Text { x: 12; y: 210; width: parent.width - 24; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight; text: B.mediaArtist; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
-                            Text { x: 12; y: 230; width: parent.width - 24; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight; text: B.mediaSource; color: Qt.rgba(1, 1, 1, 0.4); font.family: bar.uiFont; font.pixelSize: 10 }
-                            Row {
-                                x: (parent.width - 136) / 2; y: 258
-                                spacing: 8
-                                ClkBtn { width: 36; height: 34; icon: "\uE892"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPrev() }
-                                ClkBtn { width: 48; height: 34; icon: B.mediaPlaying ? "\uE769" : "\uE768"; primary: true; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPlayPause() }
-                                ClkBtn { width: 36; height: 34; icon: "\uE893"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaNext() }
-                            }
-                            Rectangle {
-                                x: 20; y: 318; width: parent.width - 40; height: 5; radius: 2.5
-                                color: Qt.rgba(1, 1, 1, 0.12)
-                                Rectangle { height: parent.height; radius: 2.5; width: parent.width * Math.max(0, Math.min(1, B.mediaProgress)); color: bar.accent }
-                                MouseArea { anchors.fill: parent; anchors.topMargin: -6; anchors.bottomMargin: -6; cursorShape: Qt.PointingHandCursor; onClicked: (m) => B.mediaSeek(Math.max(0, Math.min(1, m.x / width))) }
-                            }
-                            Text { x: 0; y: 330; width: parent.width; horizontalAlignment: Text.AlignHCenter; text: B.mediaTime; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
+                            Text { x: 66; y: 4; text: Math.round(bar.wTemp) + weatherCard.deg; color: "white"; font.family: bar.uiFont; font.pixelSize: 26; font.weight: Font.Bold }
+                            Text { x: 66; y: 38; width: parent.width - 66 - 8; elide: Text.ElideRight; text: weatherCard.info[1]; color: "white"; font.family: bar.uiFont; font.pixelSize: 11 }
+                            Text { x: 14; y: 76; text: "L " + Math.round(bar.wLo) + "\u00B0"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
+                            Text { anchors.horizontalCenter: parent.horizontalCenter; y: 76; text: "Feels " + Math.round(bar.wFeels) + "\u00B0"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
+                            Text { anchors.right: parent.right; anchors.rightMargin: 14; y: 76; text: "H " + Math.round(bar.wHi) + "\u00B0"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
                         }
+                    }
+
+                    // ================= RAM + GPU MEMORY ring tiles =================
+                    DashCard {
+                        id: ramTile
+                        enter: dashPage.enter; order: 4
+                        x: 502; y: 266; width: (parent.width - 502 - 8) / 2; height: parent.height - 266
+                        radius: 24
+                        readonly property real frac: B.ramTotal > 0 ? Math.min(1, B.ramUsed / B.ramTotal) : 0
+                        readonly property color barColor: frac > 0.9 ? "#ff6b7a" : (frac > 0.75 ? "#ffd86b" : bar.accent)
+                        RingGauge { id: ramTileRing; x: (parent.width - 62) / 2; y: 10; width: 62; height: 62; frac: ramTile.frac; ringColor: ramTile.barColor }
+                        Text { x: ramTileRing.x; y: ramTileRing.y; width: 62; height: 62; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                            text: (B.ramTotal > 0 ? Math.round(ramTile.frac * 100) + "%" : "..."); color: "white"; font.family: bar.uiFont; font.pixelSize: 15; font.weight: Font.Bold }
+                        Text { x: 0; y: 76; width: parent.width; horizontalAlignment: Text.AlignHCenter; text: "RAM"; color: bar.accent; font.family: bar.uiFont; font.pixelSize: 11; font.weight: Font.Bold }
+                        Text { x: 4; y: 91; width: parent.width - 8; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight; text: (B.ramTotal > 0 ? B.ramUsed.toFixed(1) + " / " + B.ramTotal.toFixed(1) + " GB" : "reading"); color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
+                    }
+                    DashCard {
+                        id: gpuTile
+                        enter: dashPage.enter; order: 5
+                        x: ramTile.x + ramTile.width + 8; y: 266; width: (parent.width - 502 - 8) / 2; height: parent.height - 266
+                        radius: 24
+                        readonly property real frac: (B.gpuState === "ok" && B.gpuTotal > 0) ? Math.min(1, B.gpuUsed / B.gpuTotal) : 0
+                        readonly property color barColor: frac > 0.9 ? "#ff6b7a" : (frac > 0.75 ? "#ffd86b" : bar.accent)
+                        RingGauge { id: gpuTileRing; x: (parent.width - 62) / 2; y: 10; width: 62; height: 62; frac: gpuTile.frac; ringColor: gpuTile.barColor }
+                        Text { x: gpuTileRing.x; y: gpuTileRing.y; width: 62; height: 62; horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                            text: (B.gpuState === "ok" && B.gpuTotal > 0 ? Math.round(gpuTile.frac * 100) + "%" : (B.gpuState === "none" ? "n/a" : "...")); color: "white"; font.family: bar.uiFont; font.pixelSize: 15; font.weight: Font.Bold }
+                        Text { x: 0; y: 76; width: parent.width; horizontalAlignment: Text.AlignHCenter; text: "GPU"; color: bar.accent; font.family: bar.uiFont; font.pixelSize: 11; font.weight: Font.Bold }
+                        Text { x: 4; y: 91; width: parent.width - 8; horizontalAlignment: Text.AlignHCenter; elide: Text.ElideRight; text: (B.gpuState === "ok" && B.gpuTotal > 0 ? B.gpuUsed.toFixed(1) + " / " + B.gpuTotal.toFixed(1) + " GB" : (B.gpuState === "none" ? "no GPU info" : "reading")); color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
                     }
                 }
 

@@ -11,7 +11,7 @@ param(
     [switch]$AutoStart,
     [switch]$Uninstall
 )
-$VaporVersion = 'v0.1.2'
+$VaporVersion = 'v0.1.3'
 $VaporStage   = 'closed beta testing'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -456,6 +456,20 @@ try {
     } @($Dir, (Join-Path $tmp 'new'))
     New-Shortcut $menuLnk $exe
     if ($AutoStart) { New-Shortcut $startLnk $exe }
+    # put the install folder on the user Path so `vaporctl` works from any terminal, and tell Windows + this terminal now
+    $pk = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+    try {
+        $pathRaw = [string]$pk.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+        if (-not ($pathRaw -split ';' | Where-Object { $_ -and ($_.TrimEnd('\') -eq $Dir) })) {
+            $pk.SetValue('Path', ((@($pathRaw.TrimEnd(';'), $Dir) | Where-Object { $_ }) -join ';'), 'ExpandString')
+        }
+    } finally { $pk.Close() }
+    if (($env:Path -split ';') -notcontains $Dir) { $env:Path = "$env:Path;$Dir" }
+    try {
+        Add-Type -Namespace VaporEnv -Name Broadcast -MemberDefinition '[DllImport("user32.dll", CharSet=CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint flags, uint timeout, out UIntPtr result);'
+        $res = [UIntPtr]::Zero
+        [void][VaporEnv.Broadcast]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$res)
+    } catch {}
     Set-Stage 3 'done' 'Installed'
 } catch {
     $failed = Get-Err $_

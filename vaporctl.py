@@ -2,7 +2,7 @@
 """vaporctl - command line for the running Vapor shell (stdlib only, starts instantly).
 
 Usage:  python vaporctl.py <command> [args]      (or add this folder to PATH and use vaporctl.cmd)
-Run with no arguments, or `help`, for the command list.
+Run with no arguments, or `help`, for the command list.  `--version` prints the version, `update` installs the newest release.
 
 Works whether or not Vapor is running: `start` launches it, and volume / mute / media / notify / timer / remind / layout /
 log / paths fall back to doing the job directly when the shell is down.
@@ -10,7 +10,9 @@ log / paths fall back to doing the job directly when the shell is down.
 import datetime
 import json
 import os
+import random
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -25,9 +27,14 @@ else:
 DATA = Path(os.environ.get("LOCALAPPDATA", str(HERE))) / "vapor"
 CLI_FILE = DATA / "cli.json"
 
+VERSION = "0.1.2"           # keep in step with the release tag (CI can set it from the tag before building vaporctl.exe)
+REPO = os.environ.get("VAPOR_REPO") or "LoLCraft2L/Vapor-Shell"
+INSTALL_URL = "https://raw.githubusercontent.com/%s/main/scripts/install.ps1" % REPO
+
 HELP = """vaporctl - control the running Vapor shell
 
   status                      volume, battery, wifi, media, workspace, layout, bar state
+  fetch                       logo + version + live status in one coloured card
   volume [N|+N|-N]            show / set / step the volume
   mute [on|off]               toggle (or force) mute
   media [play|next|prev]      control the active player, no argument shows what is playing
@@ -48,12 +55,20 @@ HELP = """vaporctl - control the running Vapor shell
   set location <place|auto>   weather place: "Pokhara", "Paris, France", "27.7,85.3", or auto (from your IP)
         [--f | --c]
   set name|pfp|location ...   same as setname / pfp / location
+  wallpaper [file|random]     show / set the desktop wallpaper  (also: next, prev, dir <folder>)
+  reload                      re-read config.json without restarting
+  autostart [on|off]          start Vapor at every login (a Startup shortcut)
   start                       start Vapor (does nothing if it already runs)
   restart | quit | stop       restart or close Vapor  (stop --force kills a hung copy)
+
+  update [--check|--force]    install the latest release (--check only looks, --force reinstalls the same version)
+  --version                   print the installed version
 
   log [N]                     last N lines of vapor.log (default 40)
   paths                       where config, files, log and settings live
   config | files              open config.json / the files folder
+  config get|set|unset ...    read / change one config.json key   (config get = show all)
+  doctor [--report]           check install, config, log and helpers (--report: + log tail and config for bug reports)
   --json                      (anywhere) print the raw reply
 """
 
@@ -628,6 +643,455 @@ def parse_when(s):
     return int((time.time() + parse_duration(t)) * 1000)
 
 
+# ---------------------------------------------------------------- version + update
+def _ver(s):
+    return tuple(int(x) for x in re.findall(r"\d+", s or "")[:4])
+
+
+def latest_release():
+    """Tag of the newest GitHub release (e.g. v0.1.3)."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request("https://api.github.com/repos/%s/releases/latest" % REPO,
+                                 headers={"User-Agent": "vaporctl", "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            tag = json.loads(r.read().decode("utf-8")).get("tag_name", "")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("GitHub answered %s (%s): %s" % (e.code, e.reason, "no release published yet" if e.code == 404 else "try again later"))
+    except (OSError, ValueError):
+        raise RuntimeError("could not reach GitHub (no internet?)")
+    if not tag:
+        raise RuntimeError("the latest release has no tag")
+    return tag
+
+
+def cmd_update(args):
+    """update: install the newest release. --check only reports, --force reinstalls even when up to date.
+        The real work is done by install.ps1 (same one-liner as the first install, same folder, config.json and files/
+        are kept). It runs in its own window and stops this vaporctl.exe, so we start it and leave straight away."""
+    check, force = "--check" in args, "--force" in args
+    tag = latest_release()
+    cur, new = _ver(VERSION), _ver(tag)
+    newer = (new > cur) if (new and cur) else (tag.lstrip("vV") != VERSION)
+    line = "installed v%s, latest %s" % (VERSION, tag)
+    if check:
+        return line + ("   update available: run  vaporctl update" if newer else "   (up to date)")
+    if not newer and not force:
+        return "already up to date (v%s)" % VERSION
+    if not FROZEN:
+        raise RuntimeError("running from source, so there is no install to replace (latest is %s): update with git pull" % tag)
+    import tempfile
+    ps = "& ([scriptblock]::Create((irm '%s'))) -Repo '%s' -Dir '%s'; Start-Sleep -Seconds 4" % (
+        INSTALL_URL, REPO, str(HERE).replace("'", "''"))
+    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                     cwd=tempfile.gettempdir(),                      # never inside the folder it is about to replace
+                     stdin=subprocess.DEVNULL, close_fds=True, creationflags=0x00000010)      # CREATE_NEW_CONSOLE
+    return "updating v%s -> %s: an installer window opens, Vapor restarts when it is done" % (VERSION, tag.lstrip("vV"))
+
+
+# ---------------------------------------------------------------- fetch: logo + system card
+
+# logo art + palette indices (hex digit per character) come from scripts/install.ps1
+
+LOGO_PALETTE = [(244, 235, 250), (221, 202, 244), (208, 173, 245), (192, 152, 245), (190, 158, 215), (175, 136, 245), (178, 119, 247), (181, 126, 234), (164, 111, 245), (180, 99, 240), (167, 122, 215), (161, 110, 232), (149, 98, 236), (145, 94, 212), (146, 106, 178), (110, 69, 150)]
+
+LOGO_BIG = [
+    '                                                :**++.',
+    '                                            .*%%*:',
+    '                                     .:    :%@%',
+    '                #.         .:   .+#%#+.   :*%#:',
+    '              +#@%+.       +* :#@@@@@%%%#**:  +*#%%#',
+    '             +*%@@*+.        *#*: :#@#*.  .+*#*++#+',
+    '                #:    :***+.+.:*##+:   .++#*+ :+**#%%%@@@%#:',
+    '                .  .*%#+   .*%@%: +*#%@@%*+ .++.      .#@@@*',
+    '              +:  +@#:   +#@@@@@@@@%#%#.              +@@@#',
+    '              *+  *+  *#***@@@@@@%+*@+              +%@@#:',
+    '                +.   :+ .*@@@@@@%  @%+++.  .%+   .*%@%*.',
+    '            +**+.  :*##%@@@@@@@@%  :%@@@#     .*#@%#+',
+    '         +##*.  +##%@@@@@@@@@@@%+ :*@@@#.  :*%@%*:',
+    '      +#%*:   +%##%@@@%#****####%%%%#+..+#%%#+.',
+    '    *%%*   **%@@@@@@%+ :****++.    .+#%%#*:    +*',
+    '  *%@#.  :%%@@@@@@@@%*##.      +*#%%#+.  *.   +##+',
+    '.%@@#    %@@@@@@@%%@@#+  .+*#%%#*:     .*@%+    .',
+    '*@@@%+   *%%%%#+.  ++*#%%%#*:         +*%@@#*.',
+    '.#@@@@@%%####%%%%%%#**+ :**+.            %+',
+    '   :***###***++       *#*:               .',
+]
+
+LOGO_BIG_COLORS = [
+    '                                                6bbdde',
+    '                                            d6666f',
+    '                                     7e    eb66',
+    '                14         77   43335a7   b886b',
+    '              111227       a9 222335566888be  999999',
+    '             e12223e4        4234 77657e  ddd99dfd9',
+    '                77    cccddee443337f   aa5aaa dddccccc888888',
+    '                f  ccccc   42223a a5555555a ffdf      cdc888',
+    '              9d  cccd   4222223333556bb              dc888',
+    '              99  cc  1112422123355d8b              dc8888',
+    '                ef   11 e32112555  b6bdbd  242   8d88888',
+    '            77aae  41111111235555  dc8888     7d88888',
+    '         7777a  11111122235555668 db8888b  8d88888',
+    '      7677a   1012111233555bbbb8888888bdeb8888b',
+    '    6667   d1002101233 dddbbbbb    8fb88888    e4',
+    '  6667b  c70000001223a5bc      8db88888  44   f412',
+    'b666b    20000001223335  b8db88888     22213    e',
+    '6666b6   00000012  5adb888888         e222237a',
+    '66666668bbbbbbb88688888 ddddf            33',
+    '   666666666688       cccc               a',
+]
+
+LOGO_SMALL = [
+    '                              .+*++',
+    '                        .:   #@+',
+    '          +#      *..*#@#++**#+.+*:',
+    '        .*%@*:     +#**#%#+.:+**##:.+:',
+    '          .+ .***+ *##+:+*##*++*+*###@@#',
+    '         +: *#+ :#%@@%%%%#+         #@%+',
+    '         :. : +*+*@@@@+##    +:  .*%%*',
+    '       :**+.+*#%@@@@@% :%@@. ::*%%*:',
+    '    :##*..*#%@@@%%%%%*#%%#:+#%#*.',
+    '  +%#:.*#@@@@%++++*+++.+###*:  **',
+    ':%@+  %@@@@@%@#+ :+*###+. .#*  ::',
+    '#@@#++*###*+*####**.     :*%%*.',
+    ' +##%%%###*++ .**+         +.',
+]
+
+LOGO_SMALL_COLORS = [
+    '                              666bd',
+    '                        7a   b66',
+    '          12      7a2233568bb8d9999',
+    '        e122a7     4245765dffdb9edccc8',
+    '          aa cccdf 223a555555afddcccc888',
+    '         99 ccc 222223555bb         c888',
+    '         de d 114321355b8    a2  fc888',
+    '       77aae1111112555 d8888 44b8888',
+    '    7777a111112355568b88888fb8888',
+    '  666ad40111123ddbbb88bdb8888  42',
+    '666d  200012235b bfb88888 d42  42',
+    '66bde100001335b88888     e2223a',
+    ' 666666688888 8dcd         77',
+]
+
+
+def _ansi_ok():
+    """True when stdout is a terminal that understands colour (switches ANSI on in old Windows consoles)."""
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.GetStdHandle(-11)
+            m = ctypes.c_uint32()
+            if not k.GetConsoleMode(h, ctypes.byref(m)):
+                return False
+            return bool(k.SetConsoleMode(h, m.value | 4))       # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        except Exception:
+            return False
+    return True
+
+
+def _logo_rows(art, cols, color):
+    """Colour the art: every character takes the palette entry named by the same spot in the colour map."""
+    rows = []
+    for y, line in enumerate(art):
+        crow = cols[y] if y < len(cols) else ""
+        out, last = [], None
+        for x, ch in enumerate(line):
+            if ch == " " or not color:
+                out.append(ch)
+                continue
+            idx = int(crow[x], 16) if x < len(crow) and crow[x] != " " else 0
+            if idx != last:
+                out.append("\x1b[38;2;%d;%d;%dm" % LOGO_PALETTE[idx])
+                last = idx
+            out.append(ch)
+        if color:
+            out.append("\x1b[0m")
+        rows.append("".join(out))
+    return rows
+
+
+def _fetch_info(color):
+    """The text next to the logo, as (plain, styled) pairs (plain is only used for measuring the width)."""
+    rows = []
+
+    def c(txt, rgb, bold=False):
+        return "\x1b[%s38;2;%d;%d;%dm%s\x1b[0m" % ("1;" if bold else "", rgb[0], rgb[1], rgb[2], txt) if color else txt
+
+    def add(plain, styled=None):
+        rows.append((plain, styled if (color and styled is not None) else plain))
+
+    def kv(k, v):
+        add("%-9s %s" % (k, v), c("%-9s" % k, (192, 132, 252)) + " " + c(v, (215, 200, 245)))
+
+    title = "V  A  P  O  R"
+    grad = "".join("\x1b[1;38;2;%d;%d;255m%s" % (int(250 + (160 - 250) * i / (len(title) - 1)),
+                                                  int(244 + (110 - 244) * i / (len(title) - 1)), ch)
+                   for i, ch in enumerate(title)) + "\x1b[0m"
+    add(title, grad)
+    add("fluid shell for Windows", c("fluid shell for Windows", (120, 100, 170)))
+    add("-" * 26, c("-" * 26, (58, 40, 96)))
+    name = read_json(CONFIG_FILE, {}).get("userName") or os.environ.get("USERNAME", "")
+    if name:
+        kv("user", name)
+    kv("version", "v" + VERSION)
+    resp = try_send("status", [])
+    if resp is None:
+        kv("vapor", "not running")
+    else:
+        for line in str(resp.get("text", "")).splitlines():
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                kv(parts[0], parts[1].strip())
+            elif line.strip():
+                add(line.strip())
+    if color:
+        add("", "")
+        add("", "".join("\x1b[48;2;%d;%d;%dm  " % p for p in LOGO_PALETTE) + "\x1b[0m")
+    return rows
+
+
+def cmd_fetch(logo=True, color=True, width=None):
+    """neofetch-style card: the Vapor logo on the left, version and live status on the right."""
+    info = _fetch_info(color)
+    if not logo:
+        return "\n".join(p for _, p in info)
+    cols = width or shutil.get_terminal_size((100, 30)).columns
+    info_w = max(len(p) for p, _ in info)
+    art, amap = None, None
+    for a, m in ((LOGO_BIG, LOGO_BIG_COLORS), (LOGO_SMALL, LOGO_SMALL_COLORS)):
+        if max(len(l) for l in a) + 3 + info_w <= cols - 1:
+            art, amap = a, m
+            break
+    if art is None:                                          # too narrow for any logo
+        return "\n".join(p for _, p in info)
+    lw = max(len(l) for l in art)
+    left = _logo_rows(art, amap, color)
+    top = max(0, (len(left) - len(info)) // 2)               # centre the text next to the art
+    out = []
+    for i in range(max(len(left), top + len(info))):
+        l = left[i] if i < len(left) else ""
+        lplain = art[i] if i < len(art) else ""
+        r = info[i - top][1] if 0 <= i - top < len(info) else ""
+        out.append(l + " " * (lw - len(lplain) + 3) + r)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------- doctor, autostart, reload, wallpaper, config keys
+def cmd_doctor(args):
+    """Check the install. Returns (text, ok); ok is False when something is broken (warnings do not count)."""
+    import platform
+    rows = []
+
+    def add(level, name, detail):
+        rows.append((level, name, detail))
+
+    add("ok", "vaporctl", "v%s  (%s, %s)" % (VERSION, "exe" if FROZEN else "python " + sys.version.split()[0], platform.platform()))
+    info = read_json(CLI_FILE, {})
+    if is_running():
+        add("ok", "vapor", "answering on port %s" % info.get("port", "?"))
+    else:
+        pid = _stale_pid()
+        if pid:
+            add("fail", "vapor", "pid %d is alive but not answering  (vaporctl stop --force)" % pid)
+        else:
+            add("warn", "vapor", "not running  (vaporctl start)")
+
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if not isinstance(cfg, dict):
+                raise ValueError("the top level is not an object")
+            add("ok", "config", "%s  (%d keys)" % (CONFIG_FILE, len(cfg)))
+            pfp = cfg.get("profilePicture")
+            if isinstance(pfp, str) and pfp and not any(p.exists() for p in (Path(pfp), FILES / pfp, HERE / pfp)):
+                add("warn", "picture", "profilePicture points at a missing file: %s" % pfp)
+        except (OSError, ValueError) as e:
+            add("fail", "config", "%s is not valid JSON: %s" % (CONFIG_FILE.name, e))
+    else:
+        add("warn", "config", "%s is missing  (vaporctl setname creates it)" % CONFIG_FILE)
+
+    sf = DATA / "settings.json"
+    if sf.exists():
+        try:
+            json.loads(sf.read_text(encoding="utf-8"))
+            add("ok", "settings", str(sf))
+        except (OSError, ValueError) as e:
+            add("fail", "settings", "%s is not valid JSON: %s" % (sf.name, e))
+    else:
+        add("ok", "settings", "not created yet (Vapor writes it on first run)")
+
+    ring = FILES / "ringtone.mp3"
+    add("ok" if ring.exists() else "warn", "ringtone", str(ring) if ring.exists() else "missing: alarms will be silent  (vaporctl ringtone <file.mp3>)")
+
+    logf = DATA / "vapor.log"
+    if logf.exists():
+        tail = logf.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
+        bad = [l for l in tail if re.search(r"traceback|error|exception", l, re.I)]
+        if bad:
+            add("warn", "log", "%d error line(s) in the last 200  (vaporctl log 200)" % len(bad))
+        else:
+            add("ok", "log", "no errors in the last 200 lines")
+    else:
+        add("warn", "log", "no log yet: %s" % logf)
+
+    add("ok" if shutil.which("komorebic") else "warn", "komorebi", "found" if shutil.which("komorebic") else "komorebic is not on PATH  (ws / layout need it)")
+    try:
+        import pycaw, comtypes                                # noqa: F401
+        add("ok", "pycaw", "found  (volume / mute work without Vapor)")
+    except ImportError:
+        add("warn", "pycaw", "missing: volume / mute need Vapor running  (pip install pycaw comtypes)")
+    add("ok", "autostart", "on" if _startup_lnk().exists() else "off  (vaporctl autostart on)")
+
+    tag = {"ok": "ok  ", "warn": "warn", "fail": "FAIL"}
+    lines = ["%s  %-9s %s" % (tag[l], n, d) for l, n, d in rows]
+    fails = sum(1 for r in rows if r[0] == "fail")
+    warns = sum(1 for r in rows if r[0] == "warn")
+    lines += ["", "%d problem(s), %d warning(s)" % (fails, warns) if fails or warns else "all good"]
+
+    if "--report" in args:
+        lines += ["", "---- last 40 log lines ----"]
+        try:
+            lines += logf.read_text(encoding="utf-8", errors="replace").splitlines()[-40:] or ["(empty)"]
+        except OSError:
+            lines.append("(no log)")
+        lines += ["", "---- config.json ----", json.dumps(read_json(CONFIG_FILE, {}), indent=2),
+                  "", "(paths under your home folder are shown as ~; read it over before you post it)"]
+    text = "\n".join(lines)
+    if "--report" in args:
+        text = text.replace(str(Path.home()), "~")
+    return text, fails == 0
+
+
+def _startup_lnk():
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "Vapor.lnk"
+
+
+def cmd_autostart(args):
+    lnk = _startup_lnk()
+    a = args[0].lower() if args else "status"
+    if a == "status":
+        return "autostart %s" % ("on  (Vapor starts at every login)" if lnk.exists() else "off  (turn on with: vaporctl autostart on)")
+    if a in ("off", "disable", "remove"):
+        lnk.unlink(missing_ok=True)
+        return "autostart off"
+    if a not in ("on", "enable"):
+        raise RuntimeError("autostart [on|off]")
+    if os.name != "nt":
+        raise RuntimeError("autostart is Windows only")
+    if FROZEN:
+        target, targs = str(HERE / "Vapor.exe"), ""
+    else:
+        exe = Path(sys.executable)
+        pyw = exe.with_name("pythonw.exe")
+        target, targs = str(pyw if pyw.exists() else exe), '"%s"' % (HERE / "vapor.pyw")
+    lnk.parent.mkdir(parents=True, exist_ok=True)
+    ps = ("$s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:V_LNK); $s.TargetPath = $env:V_TARGET; "
+          "$s.Arguments = $env:V_ARGS; $s.WorkingDirectory = $env:V_DIR; $s.Description = 'Vapor'; $s.Save()")
+    env = dict(os.environ, V_LNK=str(lnk), V_TARGET=target, V_ARGS=targs, V_DIR=str(HERE))
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], env=env, capture_output=True, timeout=20,
+                   creationflags=0x08000000)
+    if not lnk.exists():
+        raise RuntimeError("could not create %s" % lnk)
+    return "autostart on  (Vapor starts at every login)"
+
+
+def cmd_reload(args):
+    resp = try_send("refresh", [])
+    if resp is None:
+        return "Vapor is not running; it reads config.json when it starts"
+    if not resp.get("ok", True):
+        raise RuntimeError(resp.get("text") or "Vapor refused the reload")
+    return resp.get("text") or "config re-read"
+
+
+def _wall_get():
+    import ctypes
+    buf = ctypes.create_unicode_buffer(520)
+    ctypes.windll.user32.SystemParametersInfoW(0x0073, 520, buf, 0)           # SPI_GETDESKWALLPAPER
+    return buf.value
+
+
+def _wall_set(path):
+    import ctypes
+    if not ctypes.windll.user32.SystemParametersInfoW(0x0014, 0, str(path), 3):   # SPI_SETDESKWALLPAPER, update + broadcast
+        raise OSError("Windows refused the wallpaper")
+
+
+def _wall_pick(folder, cur, mode):
+    files = sorted(p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() in IMG_EXT)
+    if not files:
+        raise RuntimeError("no images in %s" % folder)
+    names = [str(p).lower() for p in files]
+    if mode == "random":
+        return random.choice([p for p in files if str(p).lower() != cur.lower()] or files)
+    if cur.lower() not in names:
+        return files[0] if mode == "next" else files[-1]
+    return files[(names.index(cur.lower()) + (1 if mode == "next" else -1)) % len(files)]
+
+
+def cmd_wallpaper(args):
+    if os.name != "nt":
+        raise RuntimeError("wallpaper is Windows only")
+    cfgdir = read_json(CONFIG_FILE, {}).get("wallpaperDir", "")
+    a = args[0].lower() if args else ""
+    cur = _wall_get()
+    if not a:
+        return "wallpaper  %s%s" % (cur or "(none)", "\nfolder     %s" % cfgdir if cfgdir else "")
+    if a == "dir":
+        if len(args) < 2:
+            return "wallpaper folder: %s" % (cfgdir or "not set  (vaporctl wallpaper dir <folder>)")
+        f = Path(" ".join(args[1:])).expanduser()
+        if not f.is_dir():
+            raise RuntimeError("not a folder: %s" % f)
+        config_update(wallpaperDir=str(f.resolve()))
+        return "wallpaper folder set: %s" % f.resolve()
+    if a in ("next", "prev", "previous", "random"):
+        folder = " ".join(args[1:]) or cfgdir or (str(Path(cur).parent) if cur and Path(cur).exists() else "")
+        if not folder or not Path(folder).is_dir():
+            raise RuntimeError("which folder?  vaporctl wallpaper dir <folder>")
+        pick = _wall_pick(folder, cur, "prev" if a.startswith("prev") else a)
+    else:
+        pick = Path(" ".join(args)).expanduser().resolve()
+        if not pick.is_file() or pick.suffix.lower() not in IMG_EXT:
+            raise RuntimeError("not an image file: %s" % pick)
+    _wall_set(pick)
+    apply_live("refresh")
+    return "wallpaper set: %s" % pick.name
+
+
+def cmd_config(args):
+    """config get [key] / set <key> <value> / unset <key>: edit config.json without opening it."""
+    sub = args[0].lower()
+    d = read_json(CONFIG_FILE, {})
+    if sub == "get":
+        if len(args) == 1:
+            return json.dumps(d, indent=2) if d else "{}   (config.json is empty or missing)"
+        if args[1] not in d:
+            raise RuntimeError("no key '%s' in config.json  (keys: %s)" % (args[1], ", ".join(sorted(d)) or "none"))
+        v = d[args[1]]
+        return v if isinstance(v, str) else json.dumps(v)
+    if len(args) < 2:
+        raise RuntimeError("config get [key] | set <key> <value> | unset <key>")
+    key = args[1]
+    if sub == "set":
+        if len(args) < 3:
+            raise RuntimeError("config set <key> <value>   (value: text, a number, true/false or JSON)")
+        try:
+            val = json.loads(" ".join(args[2:]))
+        except ValueError:
+            val = " ".join(args[2:])
+        text = "%s = %s" % (key, json.dumps(val))
+    else:
+        val, text = None, "%s removed" % key
+    config_update(**{key: val})
+    return text + ("" if apply_live("refresh") else "   (saved; Vapor is not running, it reads it on the next start)")
+
+
 def main(argv):
     raw = "--json" in argv
     argv = [a for a in argv if a != "--json"]
@@ -636,7 +1100,42 @@ def main(argv):
         return
     cmd, args = argv[0].lower(), argv[1:]
 
+    if cmd in ("--version", "-v", "-V", "version"):
+        text = "Vapor v%s" % VERSION
+        print(json.dumps({"ok": True, "text": text}) if raw else text)
+        return
+    if cmd in ("update", "upgrade"):
+        try:
+            text = cmd_update(args)
+        except (RuntimeError, OSError) as e:
+            die(str(e))
+        print(json.dumps({"ok": True, "text": text}) if raw else text)
+        return
+
     # ---- commands that don't need Vapor to be running
+    if cmd == "fetch":
+        tty = sys.stdout.isatty() and not raw          # --json / pipes get the plain text card, no logo
+        text = cmd_fetch(logo=tty, color=tty and _ansi_ok())
+        print(json.dumps({"ok": True, "text": text}) if raw else text)
+        return
+    if cmd == "doctor":
+        text, ok = cmd_doctor(args)
+        print(json.dumps({"ok": ok, "text": text}) if raw else text)
+        sys.exit(0 if ok else 1)
+    if cmd == "config" and args and args[0].lower() in ("get", "set", "unset"):
+        try:
+            text = cmd_config(args)
+        except (RuntimeError, ValueError, OSError) as e:
+            die(str(e))
+        print(json.dumps({"ok": True, "text": text}) if raw else text)
+        return
+    if cmd in ("autostart", "reload", "wallpaper"):
+        try:
+            text = {"autostart": cmd_autostart, "reload": cmd_reload, "wallpaper": cmd_wallpaper}[cmd](args)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as e:
+            die(str(e))
+        print(json.dumps({"ok": True, "text": text}) if raw else text)
+        return
     if cmd == "log":
         n = int(args[0]) if args else 40
         try:
