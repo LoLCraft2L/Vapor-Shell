@@ -1,1 +1,35 @@
-{"hue": 0, "theme": null, "dynamic_theme_last_wallpaper": "D:\\Customizations\\Images\\Wallpapers\\zani.jpg", "color_sat": 100, "color_light": 88, "css_theme": null, "mode": "default", "h": 0.4310810810810812, "s": 0.7019608020782471, "v": 1.0, "css": {"c:\\users\\nitro\\.config\\yasb\\styles.css": {"out": "d4cc30d6a15becb58b9389981fb295ea20b71c28"}}, "shell": {"mode": "auto", "h": 0.24459459459459462, "s": 1.0, "v": 1.0}, "outline": {"mode": "auto", "h": 0.23648648648648649, "s": 0.0, "v": 1.0}, "icons": {"mode": "auto", "h": 0.522972972972973, "s": 1.0, "v": 0.011666666666666492}}
+{
+  "hue": 194,
+  "theme": 194,
+  "dynamic_theme_last_wallpaper": "D:\\Customizations\\Images\\Wallpapers\\zani.jpg",
+  "color_sat": 100,
+  "color_light": 88,
+  "css_theme": null,
+  "mode": "default",
+  "h": 0.4310810810810812,
+  "s": 0.7019608020782471,
+  "v": 1.0,
+  "css": {
+    "c:\\users\\nitro\\.config\\yasb\\styles.css": {
+      "out": "d4cc30d6a15becb58b9389981fb295ea20b71c28"
+    }
+  },
+  "shell": {
+    "mode": "auto",
+    "h": 0.24459459459459462,
+    "s": 1.0,
+    "v": 1.0
+  },
+  "outline": {
+    "mode": "auto",
+    "h": 0.23648648648648649,
+    "s": 0.0,
+    "v": 1.0
+  },
+  "icons": {
+    "mode": "auto",
+    "h": 0.522972972972973,
+    "s": 1.0,
+    "v": 0.011666666666666492
+  }
+}

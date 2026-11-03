@@ -44,6 +44,7 @@ Window {
     readonly property int frameW: 8           // thickness of the glass border down the sides and along the bottom
     readonly property int frameR: 18          // radius of the rounded inner corners
     readonly property int flare: 14           // concave joins between the bar and a popup
+    readonly property int dockIdleFps: 20     // frame rate of the dock dashboard's ambient animations (comet, breathing ring, colon, vinyl). now runs at the display refresh rate (smooth). 0 = freeze them (only real changes repaint)
     readonly property real popSpeed: 1      // popup animation speed: 1 = original, 1.5 = 1.5x slower, 2 = twice as slow
     readonly property int hideMs: 200         // Alt+W: frame retracts
     readonly property int showMs: 320         // Alt+W / startup: frame slides back in
@@ -1151,7 +1152,7 @@ Window {
                         radius: 1
                         anchors.verticalCenter: parent.verticalCenter
                         color: bar.mix(bar.accent, bar.lavender, index / 5)
-                        Behavior on height { NumberAnimation { duration: 70 } }
+                        Behavior on height { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
                     }
                 }
             }
@@ -2799,7 +2800,11 @@ Window {
         t = t.replace(/\u0001/g, D("**")).replace(/\u0002/g, D("*")).replace(/\u0003/g, D("~~"))
         // rich text swallows a trailing newline, which made this layer one line shorter than the real input. a zero-width
         // space after it keeps that last (empty) line alive so both layers always have the same height
-        if (/\n$/.test(t)) t += "\u200b"
+        // every line break is an explicit <br> instead of a raw "\n" inside pre-wrap: Qt's rich text importer can drop an empty
+        // line (or a line right after a coloured / dimmed span) that is only a "\n", which made this layer a line shorter than
+        // the real input while the cursor, which follows the real input, stayed on the lower line
+        t = t.replace(/\n/g, "<br>")
+        if (/<br>$/.test(t)) t += "\u200b"
         return "<div style=\"white-space:pre-wrap\">" + t + "</div>"
     }
     // ---- a card that grows out of a screen edge ----
@@ -3913,7 +3918,15 @@ Window {
                     readonly property bool live: bar.dockShow && bar.dockTab === "dash"
                     onLiveChanged: { B.statsWatch(live); enterAnim.stop(); if (live) { enter = 0; enterAnim.start() } }
                     NumberAnimation { id: enterAnim; target: dashPage; property: "enter"; from: 0; to: 1; duration: 1000 }
-                    NumberAnimation { target: dashPage; property: "phase"; from: 0; to: 1; duration: 6000; loops: Animation.Infinite; running: dashPage.live }
+                    // one shared clock looping 0 -> 1 every 6 s. a real animation, so it advances every vsync (smooth
+                    // comet / breathing ring). dockIdleFps = 0 still freezes it.
+                    NumberAnimation on phase {
+                        from: 0; to: 1
+                        duration: 6000
+                        loops: Animation.Infinite
+                        easing.type: Easing.Linear
+                        running: dashPage.live && bar.dockIdleFps > 0
+                    }
                     function ease(t) { t = Math.max(0, Math.min(1, t)); return 1 - Math.pow(1 - t, 3) }
 
                     // ================= HERO: profile + clock =================
@@ -4103,7 +4116,7 @@ Window {
                                         radius: 1.75
                                         antialiasing: true
                                         color: bar.mix(bar.accent, bar.lavender, mspoke.k / 18)
-                                        Behavior on height { NumberAnimation { duration: 70 } }
+                                        Behavior on height { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
                                     }
                                 }
                             }
@@ -4113,7 +4126,14 @@ Window {
                                 antialiasing: true
                                 color: Qt.rgba(1, 1, 1, 0.08)
                                 // slow vinyl spin, pauses (keeps its angle) when the music stops
-                                NumberAnimation on rotation { from: 0; to: 360; duration: 24000; loops: Animation.Infinite; running: true; paused: !(B.mediaPlaying && dashPage.live) }
+                                NumberAnimation on rotation {
+                                    from: 0; to: 360
+                                    duration: 24000
+                                    loops: Animation.Infinite
+                                    easing.type: Easing.Linear
+                                    running: bar.dockIdleFps > 0 && dashPage.live
+                                    paused: !B.mediaPlaying
+                                }
                                 Text { anchors.centerIn: parent; text: "\uE8D6"; font.family: "Segoe Fluent Icons"; font.pixelSize: 30; color: Qt.rgba(1, 1, 1, 0.3) }
                                 RoundImage { anchors.fill: parent; radius: width / 2; cover: true; source: B.mediaArt }
                             }
@@ -4325,7 +4345,9 @@ Window {
                     }
                 }
 
-                // ---- media: big round art with the audio ring ----
+                // ---- media: ring visualizer + player, flips over to a lyrics screen ----
+                // player view: the big ring, title / artist, controls, seek bar and a "Search lyrics" button.
+                // lyrics view: the ring shrinks to the corner, the lyrics (several sources, plain text) fill the right side.
                 Item {
                     id: mediaPage
                     visible: bar.dockTab === "media"
@@ -4333,17 +4355,579 @@ Window {
                     width: parent.width - 36
                     height: parent.height - 68 - 18
                     readonly property bool has: B.mediaTitle !== ""
+                    readonly property real bass: (B.vizActive && B.vizBars.length > 0) ? B.vizBars[0] : 0
+
+                    // ---- lyrics state ----
+                    property bool lyricsOpen: false
+                    property string lyrStatus: "idle"        // idle | loading | ok | none | error
+                    property string lyrKey: ""               // the track the loaded lyrics belong to
+                    property var lyrResults: []              // alternative matches from LRCLIB (best first)
+                    property int lyrIdx: 0                   // which match is shown
+                    property var lyrLines: []                // [{ t: seconds (-1 = not synced), text }]
+                    property bool lyrSynced: false
+                    property bool lyrInstr: false
+                    property real lyrDur: 0                  // length of the matched recording, turns B.mediaProgress into seconds
+                    property real lyrOffset: 0               // manual sync nudge in seconds
+                    property string lyrErr: ""               // last failure, shown in the error message
+                    property int lyrReq: 0                   // bumped on every new search / track change, stale answers are dropped
+                    property var lyrCache: ({})
+                    property var lyrErrList: []
+                    property int lyrPending: 0               // sources that haven't answered yet
+                    property int lyrAnswered: 0              // sources that answered (even with "nothing")
+                    property int lyrOrd: 0
+                    property int lyrPhase: 1                 // 1 = the track as playing, 2 = covers only: the original song
+                    property bool lyrUserPicked: false       // the person chose a match by hand: never swap it for a "better" one
+                    property bool romajiOn: true
+                    property bool lyrHasJp: false            // the lyrics contain kana
+                    property int lyrRomCount: 0              // lines that have a romaji line
+                    property int lyrTextCount: 0
+                    property var romList: []                 // online romaji per line index (for lines the offline converter can't do: kanji)
+                    property var romCache: ({})
+                    property int romReq: 0
+                    property int romPending: 0
+                    property int romOnline: 0
+                    property string romErr: ""
+                    readonly property string trackKey: B.mediaTitle + "\n" + B.mediaArtist
+                    readonly property var cur: (lyrResults.length > lyrIdx) ? lyrResults[lyrIdx] : null
+                    readonly property string curInfo: {
+                        if (!cur) return ""
+                        var t = cur.trackName + "  \u00B7  " + cur.artistName
+                        if (cur.albumName && cur.albumName !== cur.trackName) t += "  \u00B7  " + cur.albumName
+                        t += "  \u00B7  via " + cur.src + (cur.orig ? "  \u00B7  original song" : "")
+                        if (lyrHasJp && romajiOn) t += "  \u00B7  romaji " + (lyrRomCount + romOnline) + "/" + lyrTextCount + (romPending > 0 ? " \u2026" : "") + (romErr !== "" ? "  \u00B7  online romaji failed (" + romErr + ")" : "")
+                        return t
+                    }
+                    readonly property real posSec: lyrDur > 0 ? B.mediaProgress * lyrDur + lyrOffset : -1
+                    readonly property int curIdx: {
+                        if (!lyrSynced || posSec < 0) return -1
+                        var L = lyrLines, lo = 0, hi = L.length - 1, r = -1
+                        while (lo <= hi) {
+                            var m = (lo + hi) >> 1
+                            if (L[m].t <= posSec) { r = m; lo = m + 1 } else hi = m - 1
+                        }
+                        return r
+                    }
+
                     MediaWheel { }              // scroll anywhere on the page: previous / next playing app
+
+                    // strips "(Official Video)", "[HD]", "- Topic", "VEVO" ... so the search has a chance
+                    function cleanStr(s) {
+                        return (s || "").replace(/\(.*?\)|\[.*?\]|\{.*?\}/g, " ")
+                            .replace(/\b(official\s*(music\s*)?(video|audio)|lyric\s*video|lyrics?|audio|video|hd|hq|4k|visualizer|remaster(ed)?(\s*\d{4})?)\b/ig, " ")
+                            .replace(/\s*-\s*topic\s*$/i, "").replace(/vevo$/i, "")
+                            .replace(/\s+/g, " ").trim()
+                    }
+                    // title / artist as they will be searched
+                    // covers: "Song (cover by X)", "Song cover", "Song \u6b4c\u3063\u3066\u307f\u305f" ...
+                    function isCover() { return /\bcover(ed)?\b|\u30ab\u30d0\u30fc|\u6b4c\u3063\u3066\u307f\u305f/i.test(B.mediaTitle + " " + B.mediaArtist) }
+                    function stripCover(t) {
+                        return t.replace(/\u3010[^\u3011]*(\u6b4c\u3063\u3066\u307f\u305f|cover|\u30ab\u30d0\u30fc)[^\u3011]*\u3011/ig, " ")
+                            .replace(/\u6b4c\u3063\u3066\u307f\u305f|\u30ab\u30d0\u30fc/g, " ")
+                            .replace(/\bcover(ed)?\s+by\b.*$/i, " ")
+                            .replace(/\s[-\u2013|]?\s*cover(ed)?\s*$/i, " ")
+                            .replace(/\s+/g, " ").trim()
+                    }
+                    // the original song behind a cover: cover tags gone, and no cover artist (a "Artist - Song" title gives the real artist back)
+                    function originalInfo() {
+                        var t = stripCover(cleanStr(B.mediaTitle)), a = ""
+                        if (t.indexOf(" - ") > 0) {
+                            var p = t.split(" - ")
+                            a = p[0].trim(); t = p.slice(1).join(" - ").trim()
+                        }
+                        return { t: t, a: a }
+                    }
+                    function trackInfo() {
+                        var t = stripCover(cleanStr(B.mediaTitle)), a = cleanStr(B.mediaArtist)
+                        if (a === "" && t.indexOf(" - ") > 0) {          // browser tabs often put "Artist - Song" in the title
+                            var p = t.split(" - ")
+                            a = p[0].trim(); t = p.slice(1).join(" - ").trim()
+                        }
+                        return { t: t, a: a }
+                    }
+                    function normStr(s) { return (s || "").toLowerCase().replace(/[^a-z0-9\u00c0-\u024f\u3040-\u30ff\u4e00-\u9fff]/g, "") }
+                    // "[01:23.45] some words"  ->  { t: 83.45, text: "some words" }  (a line can carry several stamps)
+                    function parseLrc(s) {
+                        var out = [], rows = s.split(/\r?\n/)
+                        for (var i = 0; i < rows.length; i++) {
+                            var re = /\[(\d+):(\d+(?:[.:]\d+)?)\]/g, m, ts = [], last = 0
+                            while ((m = re.exec(rows[i])) !== null) {
+                                ts.push(parseInt(m[1]) * 60 + parseFloat(m[2].replace(":", ".")))
+                                last = re.lastIndex
+                            }
+                            if (ts.length === 0) continue
+                            var txt = rows[i].substring(last).trim()
+                            for (var k = 0; k < ts.length; k++) out.push({ t: ts[k], text: txt })
+                        }
+                        out.sort(function (a, b) { return a.t - b.t })
+                        return out
+                    }
+
+                    // ---- kana -> romaji (Hepburn, works offline). kanji can't be read without a dictionary, so lines with kanji only get romaji when NetEase supplies it ----
+                    readonly property var kanaTable: (function () {
+                        var s = "\u3042a \u3044i \u3046u \u3048e \u304ao \u304bka \u304dki \u304fku \u3051ke \u3053ko \u3055sa \u3057shi \u3059su \u305bse \u305dso \u305fta \u3061chi \u3064tsu \u3066te \u3068to \u306ana \u306bni \u306cnu \u306dne \u306eno \u306fha \u3072hi \u3075fu \u3078he \u307bho \u307ema \u307fmi \u3080mu \u3081me \u3082mo \u3084ya \u3086yu \u3088yo \u3089ra \u308ari \u308bru \u308cre \u308dro \u308fwa \u3090i \u3091e \u3092o \u3093n \u304cga \u304egi \u3050gu \u3052ge \u3054go \u3056za \u3058ji \u305azu \u305cze \u305ezo \u3060da \u3062ji \u3065zu \u3067de \u3069do \u3070ba \u3073bi \u3076bu \u3079be \u307cbo \u3071pa \u3074pi \u3077pu \u307ape \u307dpo \u3094vu \u3041a \u3043i \u3045u \u3047e \u3049o \u3083ya \u3085yu \u3087yo"
+                        var m = {}, p = s.split(" ")
+                        for (var i = 0; i < p.length; i++) m[p[i].charAt(0)] = p[i].substring(1)
+                        return m
+                    })()
+                    function toRomaji(src) {
+                        var K = kanaTable
+                        var P = { "\u3001": ", ", "\u3002": ". ", "\uff01": "! ", "\uff1f": "? ", "\u3000": " ", "\u30fb": " ", "\u300c": "\"", "\u300d": "\"", "\uff08": "(", "\uff09": ")", "\u301c": "~" }
+                        var SV = { "\u3083": "a", "\u3085": "u", "\u3087": "o", "\u3041": "a", "\u3043": "i", "\u3045": "u", "\u3047": "e", "\u3049": "o" }
+                        var s = "", i, c
+                        for (i = 0; i < src.length; i++) {                  // katakana -> hiragana
+                            c = src.charCodeAt(i)
+                            s += (c >= 0x30A1 && c <= 0x30F6) ? String.fromCharCode(c - 0x60) : src.charAt(i)
+                        }
+                        var toks = []
+                        for (i = 0; i < s.length; i++) {
+                            var ch = s.charAt(i), nx = s.charAt(i + 1), r = K[ch]
+                            if (ch === "\u3063") { toks.push("\u0002"); continue }          // small tsu: doubles the next consonant
+                            if (ch === "\u3093") { toks.push("\u0001"); continue }          // n (becomes n' before a vowel)
+                            if (ch === "\u30fc") {                                          // long vowel mark repeats the last vowel
+                                var pv = toks.length ? toks[toks.length - 1] : ""
+                                var lv = pv.charAt(pv.length - 1)
+                                toks.push(/[aeiou]/.test(lv) ? lv : "")
+                                continue
+                            }
+                            if (r !== undefined && SV[ch] === undefined && SV[nx] !== undefined) {      // \u304d\u3083 -> kya, \u3075\u3041 -> fa, \u3066\u3043 -> ti
+                                var v = SV[nx], stem = r.substring(0, r.length - 1), o
+                                if (ch === "\u3046") o = "w" + v
+                                else if (nx === "\u3083" || nx === "\u3085" || nx === "\u3087") o = /(sh|ch|j)$/.test(stem) ? stem + v : stem + "y" + v
+                                else o = stem + v
+                                toks.push(o); i++
+                                continue
+                            }
+                            if (r !== undefined) { toks.push(r); continue }
+                            toks.push(P[ch] !== undefined ? P[ch] : ch)
+                        }
+                        var out = ""
+                        for (i = 0; i < toks.length; i++) {
+                            var t = toks[i], nt = toks[i + 1] || ""
+                            if (t === "\u0002") {
+                                if (/^ch/.test(nt)) out += "t"
+                                else if (/^[b-df-hj-np-tv-z]/.test(nt)) out += nt.charAt(0)
+                                continue
+                            }
+                            if (t === "\u0001") { out += /^[aeiouy]/.test(nt) ? "n'" : "n"; continue }
+                            out += t
+                        }
+                        out = out.replace(/ {2,}/g, " ").trim()
+                        return out.charAt(0).toUpperCase() + out.substring(1)
+                    }
+                    function localRomaji(text) {
+                        if (!/[\u3040-\u30ff]/.test(text) || /[\u4e00-\u9fff]/.test(text)) return ""      // no kana, or kanji we can't read
+                        return toRomaji(text)
+                    }
+
+                    // show one of the matches: parse its lines, attach romaji, work out what the header should say
+                    function pick(i) {
+                        if (i < 0 || i >= lyrResults.length) return
+                        var r = lyrResults[i], k
+                        lyrIdx = i
+                        lyrOffset = 0
+                        lyrDur = r.duration || 0
+                        lyrInstr = !!r.instrumental
+                        lyrSynced = false
+                        var lines = []
+                        if (!lyrInstr) {
+                            var stamped = r.syncedLyrics ? parseLrc(r.syncedLyrics) : []
+                            var rm = {}
+                            if (r.romaLrc) {                                  // NetEase romaji comes with time stamps: used only to pair it with the right line
+                                var rl = parseLrc(r.romaLrc)
+                                for (k = 0; k < rl.length; k++) rm[Math.round(rl[k].t * 10)] = rl[k].text
+                            }
+                            if (stamped.length > 0) {
+                                for (k = 0; k < stamped.length; k++) {
+                                    var q = Math.round(stamped[k].t * 10)
+                                    var rr = rm[q] || rm[q - 1] || rm[q + 1] || ""
+                                    lines.push({ t: -1, text: stamped[k].text, rom: rr !== "" ? rr : localRomaji(stamped[k].text) })
+                                }
+                            } else {
+                                var rows = (r.plainLyrics || "").split(/\r?\n/)
+                                for (var j = 0; j < rows.length; j++) {
+                                    var tt = rows[j].trim()
+                                    lines.push({ t: -1, text: tt, rom: localRomaji(tt) })
+                                }
+                            }
+                        }
+                        var rc = 0, tc = 0, jp = false
+                        for (k = 0; k < lines.length; k++) {
+                            if (lines[k].text !== "") tc++
+                            if (lines[k].rom !== "") rc++
+                            if (/[\u3040-\u30ff]/.test(lines[k].text)) jp = true
+                        }
+                        lyrRomCount = rc; lyrTextCount = tc; lyrHasJp = jp
+                        lyrLines = lines
+                        lyrStatus = (lyrInstr || lines.length > 0) ? "ok" : "none"
+                        fetchRomaji()
+                    }
+                    function pickUser(i) { lyrUserPicked = true; pick(i) }
+
+                    // ---- several sources are asked at once, whatever comes back lands in one list (synced + best title match first) ----
+                    function fetchLyrics(force) {
+                        if (!has) return
+                        var key = trackKey
+                        if (!force && lyrCache[key]) {
+                            lyrKey = key
+                            lyrResults = lyrCache[key]
+                            lyrUserPicked = false
+                            pick(0)
+                            return
+                        }
+                        var my = ++lyrReq
+                        resetResults()
+                        lyrKey = key
+                        lyrStatus = "loading"
+                        var q = trackInfo()
+                        srcLrclib(my, key, q)
+                        srcNetease(my, key, q)
+                        srcOvh(my, key, q)
+                    }
+                    // a source finished: err = "" when it answered (even with nothing), otherwise what went wrong
+                    function srcEnd(my, key, name, err, items) {
+                        if (my !== lyrReq) return
+                        lyrPending--
+                        if (err !== "") {
+                            lyrErrList = lyrErrList.concat([name + ": " + err])
+                            lyrErr = lyrErrList.join("  \u00B7  ")
+                        } else lyrAnswered++
+                        if (lyrPhase === 2) for (var i = 0; i < items.length; i++) items[i].orig = true
+                        if (items.length > 0) addResults(key, items)
+                        if (lyrPending <= 0) {
+                            if (lyrPhase === 1 && isCover()) {              // a cover: now look for the original song as well
+                                lyrPhase = 2
+                                var oq = originalInfo(), ti = trackInfo()
+                                if (oq.t !== "" && (oq.t !== ti.t || oq.a !== ti.a)) {
+                                    srcLrclib(my, key, oq)
+                                    srcNetease(my, key, oq)
+                                    srcOvh(my, key, oq)
+                                    return
+                                }
+                            }
+                            if (lyrResults.length === 0) lyrStatus = lyrAnswered > 0 ? "none" : "error"
+                        }
+                    }
+                    function addResults(key, items) {
+                        var shownId = cur ? cur.uid : ""
+                        var ti = trackInfo(), nt = normStr(ti.t), na = normStr(ti.a)
+                        var have = {}, i
+                        for (i = 0; i < lyrResults.length; i++) have[lyrResults[i].uid] = true
+                        var fresh = []
+                        for (i = 0; i < items.length; i++) if (!have[items[i].uid]) fresh.push(items[i])
+                        if (fresh.length === 0) return
+                        var all = lyrResults.concat(fresh)
+                        for (i = 0; i < all.length; i++) {
+                            var r = all[i]
+                            if (r.score !== undefined) continue
+                            var rn = normStr(r.trackName), ra = normStr(r.artistName), s = 0
+                            if (nt !== "" && rn !== "") s += (rn === nt) ? 4 : ((rn.indexOf(nt) >= 0 || nt.indexOf(rn) >= 0) ? 2 : 0)
+                            if (na !== "" && ra !== "" && (ra.indexOf(na) >= 0 || na.indexOf(ra) >= 0)) s += 1
+                            if (r.syncedLyrics || r.plainLyrics) s += 2
+                            if (r.romaLrc) s += 0.3
+                            if (r.orig) s -= 0.5                          // original of a cover: after matches for the cover itself
+                            r.score = s - (r.prio || 0) * 0.1 - (lyrOrd++) * 0.001
+                        }
+                        all.sort(function (a, b) { return b.score - a.score })
+                        all = all.slice(0, 10)
+                        lyrResults = all
+                        lyrCache[key] = all
+                        var idx = -1
+                        for (i = 0; i < all.length; i++) if (all[i].uid === shownId) idx = i
+                        if (idx < 0) pick(0)                                                                         // nothing shown yet
+                        else lyrIdx = idx                                                                            // keep showing the same one
+                    }
+
+                    // source 1: LRCLIB (synced + plain, community database, no key)
+                    function srcLrclib(my, key, q) {
+                        var qs = []
+                        if (q.a !== "") qs.push("track_name=" + encodeURIComponent(q.t) + "&artist_name=" + encodeURIComponent(q.a))
+                        qs.push("q=" + encodeURIComponent((q.a + " " + q.t).trim()))
+                        lyrPending++
+                        lrclibQuery(0, my, key, qs)
+                    }
+                    function lrclibQuery(i, my, key, qs) {
+                        var x = new XMLHttpRequest()
+                        x.timeout = 10000
+                        x.onreadystatechange = function () {
+                            if (x.readyState !== XMLHttpRequest.DONE || my !== mediaPage.lyrReq) return
+                            var list = []
+                            if (x.status === 200) {
+                                try {
+                                    var j = JSON.parse(x.responseText)
+                                    for (var k = 0; k < j.length && list.length < 4; k++) {
+                                        var e = j[k]
+                                        if (!(e.syncedLyrics || e.plainLyrics || e.instrumental)) continue
+                                        e.src = "LRCLIB"; e.prio = 0; e.uid = "lrclib:" + e.id
+                                        list.push(e)
+                                    }
+                                } catch (err) { }
+                            } else if (x.status !== 404) {
+                                mediaPage.srcEnd(my, key, "LRCLIB", "HTTP " + x.status, [])
+                                return
+                            }
+                            if (list.length === 0 && i + 1 < qs.length) { mediaPage.lrclibQuery(i + 1, my, key, qs); return }
+                            mediaPage.srcEnd(my, key, "LRCLIB", "", list)
+                        }
+                        x.open("GET", "https://lrclib.net/api/search?" + qs[i])
+                        x.send()
+                    }
+
+                    // source 2: NetEase Cloud Music (unofficial public endpoints, no key). strong on Japanese / Asian music, synced, and often has romaji
+                    function cleanNetease(lrc) {                          // drops the "lyricist: ..., composer: ..." credit lines
+                        var rows = lrc.split(/\r?\n/), out = []
+                        for (var i = 0; i < rows.length; i++) {
+                            var body = rows[i].replace(/^(\s*\[[^\]]*\])+/, "")
+                            if (body.charAt(0) === "{") continue
+                            if (/^\s*(\u4f5c\u8bcd|\u4f5c\u66f2|\u7f16\u66f2|\u4f5c\u8a5e|\u7de8\u66f2|\u8bcd|\u66f2|\u8bcd\u66f2|\u5236\u4f5c\u4eba|\u6df7\u97f3|\u6bcd\u5e26|\u5f55\u97f3|\u76d1\u5236|\u6f14\u5531|\u6b4c\u624b)\s*[:\uff1a]/.test(body)) continue
+                            out.push(rows[i])
+                        }
+                        return out.join("\n")
+                    }
+                    function srcNetease(my, key, q) {
+                        lyrPending++
+                        var x = new XMLHttpRequest()
+                        x.timeout = 10000
+                        x.onreadystatechange = function () {
+                            if (x.readyState !== XMLHttpRequest.DONE || my !== mediaPage.lyrReq) return
+                            if (x.status !== 200) { mediaPage.srcEnd(my, key, "NetEase", "HTTP " + x.status, []); return }
+                            var songs = []
+                            try { songs = JSON.parse(x.responseText).result.songs || [] } catch (e) { }
+                            songs = songs.slice(0, 3)
+                            if (songs.length === 0) { mediaPage.srcEnd(my, key, "NetEase", "", []); return }
+                            var left = songs.length, items = [], failed = 0, lastStatus = 0
+                            songs.forEach(function (sg) {
+                                var y = new XMLHttpRequest()
+                                y.timeout = 10000
+                                y.onreadystatechange = function () {
+                                    if (y.readyState !== XMLHttpRequest.DONE) return
+                                    if (my === mediaPage.lyrReq && y.status === 200) {
+                                        try {
+                                            var d = JSON.parse(y.responseText)
+                                            var lrc = (d.lrc && d.lrc.lyric) ? mediaPage.cleanNetease(d.lrc.lyric) : ""
+                                            var roma = (d.romalrc && d.romalrc.lyric) ? d.romalrc.lyric : ""
+                                            var stamped = /\[\d+:\d+/.test(lrc)
+                                            var ar = sg.artists || sg.ar || []
+                                            var al = sg.album || sg.al || {}
+                                            if (lrc.trim() !== "" || d.pureMusic) items.push({
+                                                trackName: sg.name || "", artistName: ar.length ? ar[0].name : "", albumName: al.name || "",
+                                                duration: (sg.duration || sg.dt || 0) / 1000, instrumental: !!d.pureMusic,
+                                                syncedLyrics: stamped ? lrc : "", plainLyrics: stamped ? "" : lrc, romaLrc: roma,
+                                                src: "NetEase", prio: 1, uid: "ne:" + sg.id })
+                                        } catch (e2) { }
+                                    } else { failed++; lastStatus = y.status }
+                                    if (--left === 0) mediaPage.srcEnd(my, key, "NetEase", failed === songs.length ? "HTTP " + lastStatus : "", items)
+                                }
+                                y.open("GET", "https://music.163.com/api/song/lyric?id=" + sg.id + "&lv=-1&kv=-1&tv=-1&rv=-1")
+                                y.send()
+                            })
+                        }
+                        x.open("GET", "https://music.163.com/api/search/get/web?csrf_token=&hlpretag=&hlposttag=&s=" + encodeURIComponent((q.a + " " + q.t).trim()) + "&type=1&offset=0&total=true&limit=5")
+                        x.send()
+                    }
+
+                    // source 3: lyrics.ovh (plain text only, needs artist + title)
+                    function srcOvh(my, key, q) {
+                        if (q.a === "" || q.t === "") return
+                        lyrPending++
+                        var x = new XMLHttpRequest()
+                        x.timeout = 10000
+                        x.onreadystatechange = function () {
+                            if (x.readyState !== XMLHttpRequest.DONE || my !== mediaPage.lyrReq) return
+                            var txt = ""
+                            if (x.status === 200) {
+                                try { txt = JSON.parse(x.responseText).lyrics || "" } catch (e) { }
+                            } else if (x.status !== 404) {
+                                mediaPage.srcEnd(my, key, "lyrics.ovh", "HTTP " + x.status, [])
+                                return
+                            }
+                            var items = []
+                            if (txt !== "") items.push({ trackName: q.t, artistName: q.a, albumName: "", duration: 0, plainLyrics: txt.replace(/\r/g, ""), src: "lyrics.ovh", prio: 2, uid: "ovh:" + key + ":" + q.a + ":" + q.t })
+                            mediaPage.srcEnd(my, key, "lyrics.ovh", "", items)
+                        }
+                        x.open("GET", "https://api.lyrics.ovh/v1/" + encodeURIComponent(q.a) + "/" + encodeURIComponent(q.t))
+                        x.send()
+                    }
+
+                    function lyrScrollBy(d) {
+                        lyrScroll.stop()
+                        var lo = lyrList.originY, hi = lyrList.originY + Math.max(0, lyrList.contentHeight - lyrList.height)
+                        lyrScroll.from = lyrList.contentY
+                        lyrScroll.to = Math.max(lo, Math.min(hi, lyrList.contentY + d))
+                        lyrScroll.start()
+                    }
+                    // ---- online romaji for the lines the offline converter skipped (kanji): Google's public translate endpoint, one line per request, 3 at a time ----
+                    function needsRom(t) { return /[\u3040-\u30ff\u4e00-\u9fff]/.test(t) }
+                    function fetchRomaji() {
+                        romReq++
+                        romPending = 0; romErr = ""
+                        var list = [], queue = [], online = 0, i
+                        for (i = 0; i < lyrLines.length; i++) {
+                            var L = lyrLines[i]
+                            list.push("")
+                            if (L.rom !== "" || !needsRom(L.text)) continue
+                            var c = romCache[L.text]
+                            if (c !== undefined) { list[i] = c; if (c !== "") online++; continue }
+                            queue.push(i)
+                        }
+                        romList = list
+                        romOnline = online
+                        if (!romajiOn || !lyrHasJp || queue.length === 0) return
+                        var my = romReq, next = 0
+                        romPending = queue.length
+                        var step = function () {
+                            if (my !== mediaPage.romReq || next >= queue.length) return
+                            var idx = queue[next++]
+                            mediaPage.romOne(my, idx, mediaPage.lyrLines[idx].text, step)
+                        }
+                        for (var w = 0; w < 3; w++) step()
+                    }
+                    function romOne(my, idx, text, done) {
+                        var x = new XMLHttpRequest()
+                        x.timeout = 10000
+                        x.onreadystatechange = function () {
+                            if (x.readyState !== XMLHttpRequest.DONE || my !== mediaPage.romReq) return
+                            if (x.status !== 200) {                       // blocked / rate limited: stop asking, say why
+                                mediaPage.romErr = "HTTP " + x.status
+                                mediaPage.romPending = 0
+                                mediaPage.romReq++
+                                return
+                            }
+                            var r = ""
+                            try {
+                                var seg = JSON.parse(x.responseText)[0] || []
+                                for (var k = 0; k < seg.length; k++) {
+                                    var e = seg[k]
+                                    if (e && e[0] === null && e[1] === null) {      // the transliteration entry
+                                        var v = (typeof e[3] === "string" && e[3] !== "") ? e[3] : ((typeof e[2] === "string") ? e[2] : "")
+                                        if (v !== "") r += (r !== "" ? " " : "") + v
+                                    }
+                                }
+                            } catch (err) { }
+                            if (r !== "") r = r.charAt(0).toUpperCase() + r.substring(1)
+                            mediaPage.romCache[text] = r
+                            var l = mediaPage.romList.slice()
+                            l[idx] = r
+                            mediaPage.romList = l
+                            if (r !== "") mediaPage.romOnline++
+                            mediaPage.romPending--
+                            done()
+                        }
+                        x.open("GET", "https://translate.googleapis.com/translate_a/single?client=gtx&sl=ja&tl=en&dt=t&dt=rm&q=" + encodeURIComponent(text))
+                        x.send()
+                    }
+
+                    function resetResults() {
+                        romReq++; romList = []; romPending = 0; romOnline = 0; romErr = ""
+                        lyrResults = []; lyrLines = []; lyrIdx = 0; lyrDur = 0; lyrOffset = 0
+                        lyrSynced = false; lyrInstr = false
+                        lyrErr = ""; lyrErrList = []; lyrPhase = 1; lyrPending = 0; lyrAnswered = 0; lyrOrd = 0; lyrUserPicked = false
+                        lyrHasJp = false; lyrRomCount = 0; lyrTextCount = 0
+                    }
+                    function resetLyrics() {
+                        lyrReq++
+                        lyrKey = ""; lyrStatus = "idle"
+                        resetResults()
+                    }
+
+                    // new track: drop the old lyrics, and if the lyrics screen is open look the new ones up
+                    onTrackKeyChanged: { resetLyrics(); lyrDebounce.restart() }
+                    Timer { id: lyrDebounce; interval: 400; onTriggered: if (mediaPage.lyricsOpen && mediaPage.has) mediaPage.fetchLyrics(false) }
+                    onRomajiOnChanged: if (romajiOn && lyrLines.length > 0) fetchRomaji()
+                    onLyricsOpenChanged: if (lyricsOpen && has && lyrKey !== trackKey) fetchLyrics(false)
+                    onHasChanged: if (!has) lyricsOpen = false
+                    Connections {
+                        target: bar
+                        function onDockPChanged() { if (bar.dockP <= 0.002) mediaPage.lyricsOpen = false }      // dock folded away: next time it opens on the player
+                    }
+
+                    // ---- seek bar: hover grows it, click or drag to seek ----
+                    component SeekBar: Item {
+                        id: sk
+                        height: 16
+                        property bool dragging: false
+                        property real dragFrac: 0
+                        property real lastSent: -1
+                        readonly property real frac: dragging ? dragFrac : Math.max(0, Math.min(1, B.mediaProgress))
+                        readonly property bool hot: skMouse.containsMouse || dragging
+                        Rectangle {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: parent.width
+                            height: sk.hot ? 7 : 4
+                            radius: height / 2
+                            color: Qt.rgba(1, 1, 1, 0.12)
+                            Behavior on height { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
+                            Rectangle {
+                                width: parent.width * sk.frac
+                                height: parent.height
+                                radius: parent.radius
+                                gradient: Gradient {
+                                    orientation: Gradient.Horizontal
+                                    GradientStop { position: 0; color: bar.accent }
+                                    GradientStop { position: 1; color: bar.lavender }
+                                }
+                                Behavior on width { enabled: !sk.dragging; NumberAnimation { duration: 250; easing.type: Easing.Linear } }
+                            }
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                x: parent.width * sk.frac - width / 2
+                                width: sk.hot ? 12 : 0
+                                height: width; radius: width / 2
+                                antialiasing: true
+                                color: "white"
+                                Behavior on width { NumberAnimation { duration: 130; easing.type: Easing.OutBack } }
+                            }
+                        }
+                        MouseArea {
+                            id: skMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onPressed: (m) => { sk.dragging = true; sk.lastSent = -1; sk.seekTo(m.x) }
+                            onPositionChanged: (m) => sk.seekTo(m.x)
+                            onReleased: sk.commit()
+                            onCanceled: { sk.dragging = false; sk.lastSent = -1 }
+                        }
+                        function seekTo(px) {
+                            if (!dragging) return
+                            var f = Math.max(0, Math.min(1, px / width))
+                            dragFrac = f
+                            if (Math.abs(f - lastSent) > 0.005) { lastSent = f; B.mediaSeek(f) }     // don't spam the app on every pixel
+                        }
+                        function commit() {
+                            if (dragging) { lastSent = dragFrac; B.mediaSeek(dragFrac); dragging = false }
+                        }
+                    }
+
+                    // a very faint wash of the album art behind everything
+                    RoundImage { visible: mediaPage.has; anchors.fill: parent; radius: 20; cover: true; source: B.mediaArt; opacity: 0.07 }
+
                     Text { visible: !mediaPage.has; anchors.centerIn: parent; text: "Nothing playing"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 13 }
                     Item {
                         visible: mediaPage.has
                         anchors.fill: parent
 
-                        // the ring: 36 spokes around the art, driven by the live audio bands (B.vizBars)
+                        // the ring: 36 spokes around the art, driven by the live audio bands (B.vizBars).
+                        // it glides to the top-left corner and shrinks to half size while the lyrics are open
                         Item {
                             id: vizRing
-                            x: 20; y: (parent.height - height) / 2
+                            readonly property bool small: mediaPage.lyricsOpen
+                            x: small ? 6 : 20
+                            y: small ? 2 : (parent.height - height) / 2
                             width: 340; height: 340
+                            scale: small ? 0.5 : 1
+                            transformOrigin: Item.TopLeft
+                            Behavior on x { NumberAnimation { duration: 460; easing.type: Easing.BezierSpline; easing.bezierCurve: bar.curveEmphasized } }
+                            Behavior on y { NumberAnimation { duration: 460; easing.type: Easing.BezierSpline; easing.bezierCurve: bar.curveEmphasized } }
+                            Behavior on scale { NumberAnimation { duration: 460; easing.type: Easing.BezierSpline; easing.bezierCurve: bar.curveEmphasized } }
+                            // soft glow that swells with the bass
+                            Rectangle {
+                                anchors.centerIn: parent
+                                width: 196 + mediaPage.bass * 44
+                                height: width; radius: width / 2
+                                antialiasing: true
+                                color: Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, 0.07 + mediaPage.bass * 0.12)
+                                Behavior on width { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+                            }
                             Repeater {
                                 model: 36
                                 Item {
@@ -4363,7 +4947,7 @@ Window {
                                         radius: 2.5
                                         antialiasing: true
                                         color: bar.mix(bar.accent, bar.lavender, spoke.k / 18)
-                                        Behavior on height { NumberAnimation { duration: 70 } }
+                                        Behavior on height { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
                                     }
                                 }
                             }
@@ -4377,26 +4961,353 @@ Window {
                             }
                         }
 
+                        // ================= PLAYER VIEW =================
                         Item {
-                            x: 400; y: 0
-                            width: parent.width - 400; height: parent.height
-                            Text { x: 0; y: 86; width: parent.width; elide: Text.ElideRight; text: B.mediaTitle; color: "white"; font.family: bar.uiFont; font.pixelSize: 22; font.weight: Font.Bold }
-                            Text { x: 0; y: 122; width: parent.width; elide: Text.ElideRight; text: B.mediaArtist; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 15 }
-                            Text { x: 0; y: 148; width: parent.width; elide: Text.ElideRight; text: B.mediaSource; color: Qt.rgba(1, 1, 1, 0.4); font.family: bar.uiFont; font.pixelSize: 11 }
-                            Row {
-                                x: 0; y: 186
+                            id: infoPane
+                            x: 400
+                            width: parent.width - 400
+                            height: parent.height
+                            opacity: mediaPage.lyricsOpen ? 0 : 1
+                            visible: opacity > 0.01
+                            enabled: !mediaPage.lyricsOpen
+                            Behavior on opacity { NumberAnimation { duration: 220 } }
+                            transform: Translate {
+                                x: mediaPage.lyricsOpen ? -18 : 0
+                                Behavior on x { NumberAnimation { duration: 280; easing.type: Easing.OutCubic } }
+                            }
+
+                            Column {
+                                width: parent.width
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 0
+
+                                // source + little live equalizer
+                                Row {
+                                    spacing: 8
+                                    height: 16
+                                    Item {
+                                        width: 20; height: 12
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        Repeater {
+                                            model: 4
+                                            Rectangle {
+                                                required property int index
+                                                x: index * 5
+                                                anchors.bottom: parent.bottom
+                                                width: 3
+                                                height: 3 + (B.vizActive && B.vizBars.length > index ? B.vizBars[index] : 0) * 9
+                                                radius: 1.5
+                                                color: bar.accent
+                                                Behavior on height { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+                                            }
+                                        }
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: (B.mediaSource || "").toUpperCase()
+                                        color: Qt.rgba(1, 1, 1, 0.4)
+                                        font.family: bar.uiFont; font.pixelSize: 10; font.letterSpacing: 1.5
+                                    }
+                                }
+                                Item { width: 1; height: 12 }
+                                Text {
+                                    width: parent.width
+                                    text: B.mediaTitle
+                                    color: "white"
+                                    wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+                                    font.family: bar.uiFont; font.pixelSize: 24; font.weight: Font.Bold
+                                }
+                                Item { width: 1; height: 4 }
+                                Text { width: parent.width; elide: Text.ElideRight; text: B.mediaArtist; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 15 }
+                                Item { width: 1; height: 24 }
+                                Row {
+                                    spacing: 10
+                                    ClkBtn { width: 46; height: 42; icon: "\uE892"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPrev() }
+                                    ClkBtn { width: 60; height: 42; icon: B.mediaPlaying ? "\uE769" : "\uE768"; primary: true; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPlayPause() }
+                                    ClkBtn { width: 46; height: 42; icon: "\uE893"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaNext() }
+                                }
+                                Item { width: 1; height: 22 }
+                                SeekBar { width: parent.width }
+                                Text { text: B.mediaTime; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 11 }
+                                Item { width: 1; height: 20 }
+
+                                // the lyrics button. once lyrics are loaded for this track it shows the line being sung
+                                Rectangle {
+                                    id: lyrBtn
+                                    width: parent.width
+                                    height: 48
+                                    radius: 14
+                                    antialiasing: true
+                                    readonly property bool loaded: mediaPage.lyrKey === mediaPage.trackKey && mediaPage.lyrStatus === "ok"
+                                    readonly property string liveLine: (loaded && mediaPage.lyrSynced && mediaPage.curIdx >= 0) ? mediaPage.lyrLines[mediaPage.curIdx].text : ""
+                                    color: Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, lyrBtnMouse.containsMouse ? 0.30 : 0.18)
+                                    border.width: 1
+                                    border.color: Qt.rgba(bar.accent.r, bar.accent.g, bar.accent.b, 0.55)
+                                    scale: lyrBtnMouse.pressed ? 0.98 : 1
+                                    Behavior on scale { NumberAnimation { duration: 80 } }
+                                    Behavior on color { ColorAnimation { duration: 110 } }
+                                    Text {
+                                        id: lyrBtnIcon
+                                        x: 16; anchors.verticalCenter: parent.verticalCenter
+                                        text: "\uE721"; font.family: "Segoe Fluent Icons"; font.pixelSize: 16; color: bar.accent
+                                    }
+                                    Column {
+                                        x: 46
+                                        width: parent.width - 46 - 14
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: 1
+                                        Text {
+                                            text: lyrBtn.loaded ? "Show lyrics" : "Search lyrics"
+                                            color: "white"; font.family: bar.uiFont; font.pixelSize: 13; font.weight: Font.DemiBold
+                                        }
+                                        Text {
+                                            width: parent.width
+                                            elide: Text.ElideRight
+                                            text: lyrBtn.liveLine !== "" ? lyrBtn.liveLine : (lyrBtn.loaded ? "lyrics found" : "find lyrics online")
+                                            color: lyrBtn.liveLine !== "" ? bar.accent : Qt.rgba(1, 1, 1, 0.45)
+                                            font.family: bar.uiFont; font.pixelSize: 10
+                                        }
+                                    }
+                                    MouseArea {
+                                        id: lyrBtnMouse
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: mediaPage.lyricsOpen = true
+                                    }
+                                }
+                            }
+                        }
+
+                        // ================= LYRICS VIEW =================
+                        // left: compact track info + controls under the shrunken ring
+                        Item {
+                            id: lyrLeft
+                            width: 190
+                            height: parent.height
+                            opacity: mediaPage.lyricsOpen ? 1 : 0
+                            visible: opacity > 0.01
+                            enabled: mediaPage.lyricsOpen
+                            Behavior on opacity { NumberAnimation { duration: 240 } }
+                            Column {
+                                x: 6; y: 186
+                                width: 178
+                                spacing: 2
+                                Text {
+                                    width: parent.width
+                                    text: B.mediaTitle
+                                    color: "white"
+                                    wrapMode: Text.WordWrap; maximumLineCount: 2; elide: Text.ElideRight
+                                    font.family: bar.uiFont; font.pixelSize: 15; font.weight: Font.Bold
+                                }
+                                Text { width: parent.width; elide: Text.ElideRight; text: B.mediaArtist; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 12 }
+                                Item { width: 1; height: 10 }
+                                Row {
+                                    spacing: 8
+                                    ClkBtn { width: 36; height: 32; icon: "\uE892"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPrev() }
+                                    ClkBtn { width: 48; height: 32; icon: B.mediaPlaying ? "\uE769" : "\uE768"; primary: true; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPlayPause() }
+                                    ClkBtn { width: 36; height: 32; icon: "\uE893"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaNext() }
+                                }
+                                Item { width: 1; height: 10 }
+                                SeekBar { width: parent.width }
+                                Text { text: B.mediaTime; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 10 }
+                            }
+                        }
+
+                        // right: the lyrics card
+                        Item {
+                            id: lyrPane
+                            x: 204
+                            width: parent.width - 204
+                            height: parent.height
+                            opacity: mediaPage.lyricsOpen ? 1 : 0
+                            visible: opacity > 0.01
+                            enabled: mediaPage.lyricsOpen
+                            Behavior on opacity { NumberAnimation { duration: 260 } }
+                            transform: Translate {
+                                x: mediaPage.lyricsOpen ? 0 : 22
+                                Behavior on x { NumberAnimation { duration: 340; easing.type: Easing.OutCubic } }
+                            }
+
+                            Rectangle { anchors.fill: parent; radius: 18; antialiasing: true; color: Qt.rgba(1, 1, 1, 0.05) }
+
+                            // header: status on the left, tools on the right
+                            Item {
+                                id: lyrHead
+                                x: 14; y: 8
+                                width: parent.width - 28
+                                height: 30
+                                Row {
+                                    spacing: 8
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    Rectangle {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        width: 8; height: 8; radius: 4
+                                        color: mediaPage.lyrStatus === "ok" ? bar.accent : (mediaPage.lyrStatus === "loading" || mediaPage.lyrStatus === "idle" ? bar.lavender : Qt.rgba(1, 1, 1, 0.35))
+                                    }
+                                    Text {
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: mediaPage.lyrStatus === "ok" ? (mediaPage.lyrInstr ? "Instrumental" : "Lyrics") : (mediaPage.lyrStatus === "none" ? "No lyrics found" : (mediaPage.lyrStatus === "error" ? "Lyrics unavailable" : "Searching\u2026"))
+                                        color: "white"; font.family: bar.uiFont; font.pixelSize: 13; font.weight: Font.DemiBold
+                                    }
+                                }
+                                Row {
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    spacing: 6
+                                    // other matches
+                                    Row {
+                                        visible: mediaPage.lyrResults.length > 1
+                                        spacing: 2
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        ClkBtn { width: 26; height: 26; icon: "\uE76B"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: mediaPage.pickUser((mediaPage.lyrIdx - 1 + mediaPage.lyrResults.length) % mediaPage.lyrResults.length) }
+                                        Text { anchors.verticalCenter: parent.verticalCenter; width: 32; horizontalAlignment: Text.AlignHCenter; text: (mediaPage.lyrIdx + 1) + "/" + mediaPage.lyrResults.length; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 11 }
+                                        ClkBtn { width: 26; height: 26; icon: "\uE76C"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: mediaPage.pickUser((mediaPage.lyrIdx + 1) % mediaPage.lyrResults.length) }
+                                    }
+                                    ClkBtn { visible: mediaPage.lyrHasJp; width: 32; height: 26; text: "Aa"; selected: mediaPage.romajiOn; accent: bar.accent; fontFamily: bar.uiFont; onClicked: mediaPage.romajiOn = !mediaPage.romajiOn }
+                                    ClkBtn { width: 28; height: 26; icon: "\uE72C"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: mediaPage.fetchLyrics(true) }
+                                    ClkBtn { width: 28; height: 26; icon: "\uE711"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: mediaPage.lyricsOpen = false }
+                                }
+                            }
+                            // which recording was matched, so a wrong match is easy to spot
+                            Text {
+                                x: 14; y: 40
+                                width: parent.width - 28
+                                elide: Text.ElideRight
+                                visible: mediaPage.cur !== null
+                                text: mediaPage.curInfo
+                                color: Qt.rgba(1, 1, 1, 0.4); font.family: bar.uiFont; font.pixelSize: 10
+                            }
+                            Rectangle { x: 14; y: 60; width: parent.width - 28; height: 1; color: Qt.rgba(1, 1, 1, 0.1) }
+
+                            // the lines. the current one is centred and bright, the rest fade out towards the edges. click a line to jump there
+                            ListView {
+                                id: lyrList
+                                x: 4; y: 64
+                                width: parent.width - 8
+                                height: parent.height - 64 - 6
+                                clip: true
+                                visible: mediaPage.lyrStatus === "ok" && !mediaPage.lyrInstr
+                                model: mediaPage.lyrLines
+                                spacing: 2
+                                boundsBehavior: Flickable.StopAtBounds
+                                highlightRangeMode: ListView.ApplyRange
+                                preferredHighlightBegin: height * 0.34
+                                preferredHighlightEnd: height * 0.62
+                                highlightMoveDuration: 420
+                                highlight: Item { }
+                                header: Item { width: 1; height: 24 }
+                                footer: Item { width: 1; height: 80 }
+                                onCountChanged: currentIndex = mediaPage.curIdx
+                                Connections {
+                                    target: mediaPage
+                                    function onCurIdxChanged() { lyrList.currentIndex = mediaPage.curIdx }
+                                }
+                                delegate: Item {
+                                    id: ld
+                                    required property int index
+                                    required property var modelData
+                                    readonly property string romText: (mediaPage.romList[index] || "") !== "" ? mediaPage.romList[index] : (modelData.rom || "")
+                                    readonly property bool act: mediaPage.lyrSynced && index === mediaPage.curIdx
+                                    readonly property int dist: (mediaPage.lyrSynced && mediaPage.curIdx >= 0) ? Math.abs(index - mediaPage.curIdx) : 0
+                                    readonly property real vy: y - lyrList.contentY
+                                    readonly property real edge: Math.max(0, Math.min(1, Math.min(vy + height, lyrList.height - vy) / 46))
+                                    width: ListView.view.width
+                                    height: lt.implicitHeight + 12
+                                    opacity: (act ? 1 : (mediaPage.lyrSynced ? Math.max(0.3, 0.7 - dist * 0.12) : 0.85)) * edge
+                                    Behavior on opacity { NumberAnimation { duration: 200 } }
+                                    Column {
+                                        id: lt
+                                        x: 18; y: 6
+                                        width: parent.width - 54
+                                        spacing: 1
+                                        scale: ld.act ? 1.1 : 1
+                                        transformOrigin: Item.Left
+                                        Behavior on scale { NumberAnimation { duration: 220; easing.type: Easing.OutCubic } }
+                                        Text {
+                                            width: parent.width
+                                            wrapMode: Text.WordWrap
+                                            text: ld.modelData.text === "" ? "\u266A" : ld.modelData.text
+                                            color: (ld.act || !mediaPage.lyrSynced) ? "white" : bar.muted
+                                            font.family: bar.uiFont
+                                            font.pixelSize: 17
+                                            Behavior on color { ColorAnimation { duration: 200 } }
+                                        }
+                                        Text {
+                                            visible: mediaPage.romajiOn && ld.romText !== ""
+                                            width: parent.width
+                                            wrapMode: Text.WordWrap
+                                            text: ld.romText
+                                            color: ld.act ? bar.accent : Qt.rgba(1, 1, 1, 0.38)
+                                            font.family: bar.uiFont
+                                            font.pixelSize: 12
+                                            Behavior on color { ColorAnimation { duration: 200 } }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // scroll arrows: one tap moves the lyrics about two thirds of a page (the mouse wheel works too)
+                            NumberAnimation { id: lyrScroll; target: lyrList; property: "contentY"; duration: 280; easing.type: Easing.OutCubic }
+                            Column {
+                                visible: lyrList.visible && lyrList.contentHeight > lyrList.height
+                                x: parent.width - 40
+                                y: parent.height - height - 14
+                                spacing: 4
+                                ClkBtn {
+                                    width: 28; height: 28; icon: "\uE70E"; accent: bar.accent; fontFamily: bar.uiFont
+                                    opacity: lyrList.atYBeginning ? 0.3 : 1
+                                    onClicked: mediaPage.lyrScrollBy(-lyrList.height * 0.66)
+                                }
+                                ClkBtn {
+                                    width: 28; height: 28; icon: "\uE70D"; accent: bar.accent; fontFamily: bar.uiFont
+                                    opacity: lyrList.atYEnd ? 0.3 : 1
+                                    onClicked: mediaPage.lyrScrollBy(lyrList.height * 0.66)
+                                }
+                            }
+
+                            // searching
+                            Text {
+                                visible: mediaPage.lyrStatus === "loading" || mediaPage.lyrStatus === "idle"
+                                anchors.horizontalCenter: parent.horizontalCenter
+                                y: parent.height / 2 - 10
+                                text: "Searching lyrics\u2026"
+                                color: bar.muted; font.family: bar.uiFont; font.pixelSize: 14
+                                SequentialAnimation on opacity {
+                                    running: mediaPage.lyricsOpen && (mediaPage.lyrStatus === "loading" || mediaPage.lyrStatus === "idle")
+                                    loops: Animation.Infinite
+                                    NumberAnimation { to: 0.35; duration: 700; easing.type: Easing.InOutSine }
+                                    NumberAnimation { to: 1; duration: 700; easing.type: Easing.InOutSine }
+                                }
+                            }
+                            // instrumental
+                            Column {
+                                visible: mediaPage.lyrStatus === "ok" && mediaPage.lyrInstr
+                                anchors.centerIn: parent
+                                spacing: 8
+                                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "\u266A"; color: bar.accent; font.family: bar.uiFont; font.pixelSize: 42 }
+                                Text { anchors.horizontalCenter: parent.horizontalCenter; text: "Instrumental, no lyrics"; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 14 }
+                            }
+                            // nothing found / offline
+                            Column {
+                                visible: mediaPage.lyrStatus === "none" || mediaPage.lyrStatus === "error"
+                                anchors.centerIn: parent
                                 spacing: 10
-                                ClkBtn { width: 46; height: 42; icon: "\uE892"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPrev() }
-                                ClkBtn { width: 60; height: 42; icon: B.mediaPlaying ? "\uE769" : "\uE768"; primary: true; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaPlayPause() }
-                                ClkBtn { width: 46; height: 42; icon: "\uE893"; accent: bar.accent; fontFamily: bar.uiFont; onClicked: B.mediaNext() }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    text: mediaPage.lyrStatus === "error" ? "Couldn't reach any lyrics service" : "No lyrics for this track"
+                                    color: "white"; font.family: bar.uiFont; font.pixelSize: 15
+                                }
+                                Text {
+                                    anchors.horizontalCenter: parent.horizontalCenter
+                                    width: lyrPane.width - 60
+                                    horizontalAlignment: Text.AlignHCenter
+                                    wrapMode: Text.WordWrap
+                                    text: mediaPage.lyrStatus === "error" ? (mediaPage.lyrErr !== "" ? mediaPage.lyrErr + "  \u00B7  " : "") + "check your connection and try again" : "tried \u201C" + mediaPage.cleanStr(B.mediaTitle) + "\u201D"
+                                    color: bar.muted; font.family: bar.uiFont; font.pixelSize: 11
+                                }
+                                ClkBtn { anchors.horizontalCenter: parent.horizontalCenter; height: 32; icon: "\uE72C"; text: "Search again"; primary: true; accent: bar.accent; fontFamily: bar.uiFont; onClicked: mediaPage.fetchLyrics(true) }
                             }
-                            Rectangle {
-                                x: 0; y: 252; width: parent.width; height: 6; radius: 3
-                                color: Qt.rgba(1, 1, 1, 0.12)
-                                Rectangle { height: parent.height; radius: 3; width: parent.width * Math.max(0, Math.min(1, B.mediaProgress)); color: bar.accent }
-                                MouseArea { anchors.fill: parent; anchors.topMargin: -7; anchors.bottomMargin: -7; cursorShape: Qt.PointingHandCursor; onClicked: (m) => B.mediaSeek(Math.max(0, Math.min(1, m.x / width))) }
-                            }
-                            Text { x: 0; y: 266; text: B.mediaTime; color: bar.muted; font.family: bar.uiFont; font.pixelSize: 11 }
                         }
                     }
                 }

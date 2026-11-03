@@ -4,7 +4,7 @@ cc_backend.py - the engine behind ControlCenter.qml (shows up in QML as `CC`).
 Wi-Fi / Bluetooth, do not disturb, dark mode, brightness, mic, the per-app mixer, CPU / RAM / GPU / network /
 disk stats, the theme card, clear cache, Project / Cast and the power menu all live here.
 
-Keep it next to vapor.pyw, vapor.pyw imports it and there is nothing else to run.
+Must sit next to vapor.pyw, which imports it; it is not run on its own.
 Speaker volume stays in vapor.pyw's own backend.
 Log: %TEMP%\\vapor_control_center.log
 """
@@ -29,7 +29,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from PySide6.QtCore import QObject, QTimer, Property, Signal, Slot
 
-CONFIG_DIR = r"C:\Users\NITRO\.config"      # what the Configure button opens
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config")      # target of the Configure button
 NOWIN = 0x08000000       # CREATE_NO_WINDOW
 TMP = tempfile.gettempdir()
 STAMP = os.path.join(TMP, "vapor_cc_closed.txt")
@@ -47,12 +47,12 @@ def log(msg):
 
 # ---- theme ----
 # three targets: shell (glass fill), outline (its rim) and icons (every icon / accent). each one either follows
-# the wallpaper ("auto") or uses one colour from the Theme card ("custom", h / s / v from 0 to 1).
-# the bar gets picked colours straight away through themeColors, the file is saved a bit after you let go.
+# the wallpaper ("auto") or uses a single colour from the Theme card ("custom", h / s / v from 0 to 1).
+# picked colours reach the bar immediately through themeColors; the file is saved shortly after the last change.
 THEME_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cc_theme.json")
 _THEME_LOCK = threading.RLock()
 
-_BASE_ACCENT = (76, 194, 255)        # the original blue, #4cc2ff
+_BASE_ACCENT = (76, 194, 255)        # default accent blue, #4cc2ff
 
 
 def _tclamp(x, lo=0.0, hi=1.0):
@@ -123,7 +123,7 @@ def load_theme():
 
 
 def theme_bar_colors(t):
-    """Only the parts you overrode, as '#AARRGGBB'. A missing key means that part follows the wallpaper."""
+    """Only the parts that were overridden, as '#AARRGGBB'. A missing key means that part follows the wallpaper."""
     out = {}
     rgb = lambda e: _hsv_rgb(e["h"], e["s"], e["v"])      # noqa: E731
     if t["shell"]["mode"] == "custom":
@@ -139,31 +139,31 @@ def theme_bar_colors(t):
 LOCATION_URI = "ms-settings:privacy-location"
 
 # ---- clear cache ----
-# what gets cleared, by group (>clearcache in Synapse runs this same code):
+# what gets cleared, by group (the clearcache command in Synapse runs this same code):
 #   Vapor    icon / album art / avatar caches in %LOCALAPPDATA%\vapor, the control center's own cache + log,
 #            __pycache__ folders and .log files next to the scripts
-#   Harmony  thumbnails and converted wallpapers from its cache folder (the one Windows is showing stays),
+#   Harmony  thumbnails and converted wallpapers from its cache folder (the active wallpaper is kept),
 #            colors.json, error.log and the wallpaper_next.txt hand-off file
 #   Synapse  its cache / temp folders, stray .log / .tmp / .cache files and the launcher log
 #   System   crash dumps, shader + thumbnail caches, error reports, pip cache
 #   Temp     anything in the temp folder older than CLEAN_TEMP_MIN_AGE_HOURS (running programs' _MEI* folders
 #            are left alone, locked files get skipped)
-# never touched: cc_theme.json, config.json, settings.json, favourites, your scripts
+# never touched: cc_theme.json, config.json, settings.json, favourites, user scripts
 CLEAN_TEMP_MIN_AGE_HOURS = 1
 CLEAN_EXTRA = [
-    # r"C:/Users/NITRO/AppData/Local/Temp/wallpaper_thumbs",       # anything else you want gone, ends up under "Other"
+    # r"C:/path/to/extra/folder",       # any additional folder to clear, listed under "Other"
 ]
 
 _LOCAL = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
 _ROAM = os.environ.get("APPDATA") or os.path.expanduser("~")
 HERE = os.path.dirname(os.path.abspath(__file__))
-VAPOR_DATA_DIR = os.path.join(_LOCAL, "vapor")                 # vapor.pyw keeps its icons / art / log here
-HARMONY_DIRS = [os.path.join(_LOCAL, n) for n in ("Harmony", "WallpaperPicker")]    # WallpaperPicker was the old name
+VAPOR_DATA_DIR = os.path.join(_LOCAL, "vapor")                 # vapor.pyw stores its icons, art and log here
+HARMONY_DIRS = [os.path.join(_LOCAL, n) for n in ("Harmony", "WallpaperPicker")]    # legacy folder name
 SYNAPSE_DIRS = [os.path.join(_LOCAL, "Synapse"), os.path.join(_ROAM, "Synapse"),
                 os.path.expanduser("~/.config/synapse"), os.path.expanduser("~/.cache/synapse")]
 _CACHE_WORDS = ("cache", "thumb", "tmp", "temp")               # sub-folders with one of these words in the name count as cache
 _JUNK_EXT = (".log", ".tmp", ".cache")
-# stuff in Windows' own folders that is safe to drop, it gets rebuilt
+# files in Windows' own folders that are safe to delete, they are rebuilt automatically
 SYSTEM_JUNK_DIRS = [
     os.path.join(_LOCAL, "CrashDumps"),
     os.path.join(_LOCAL, "D3DSCache"),
@@ -173,7 +173,7 @@ SYSTEM_JUNK_DIRS = [
 ]
 CLEAN_GROUPS = [("vapor", "Vapor"), ("harmony", "Harmony"), ("synapse", "Synapse"),
                 ("system", "System leftovers"), ("temp", "Temp files"), ("extra", "Other")]
-_CLEAN_LABELS = {}        # path -> group name from the last scan, so the log can say what each deletion was
+_CLEAN_LABELS = {}        # path -> group name from the last scan, used to label each deletion in the log
 
 
 def _path_size(path):
@@ -207,9 +207,9 @@ def clean_groups():
     protected = {os.path.normcase(os.path.abspath(p)) for p in (
         __file__, THEME_FILE, STAMP,
         os.path.join(HERE, "config.json"),
-        os.path.join(VAPOR_DATA_DIR, "vapor.log"),            # open right now anyway
+        os.path.join(VAPOR_DATA_DIR, "vapor.log"),            # in use right now anyway
         os.path.join(VAPOR_DATA_DIR, "settings.json"),
-        os.path.join(VAPOR_DATA_DIR, "cli.json"),             # vaporctl needs this while Vapor runs
+        os.path.join(VAPOR_DATA_DIR, "cli.json"),             # needed by vaporctl while Vapor is running
         os.path.join(VAPOR_DATA_DIR, "path_entry.txt"))}
     owner, found = {}, {k: [] for k, _ in CLEAN_GROUPS}
 
@@ -217,7 +217,7 @@ def clean_groups():
         key = os.path.normcase(os.path.abspath(p))
         if key in protected or key in owner or not os.path.lexists(p):
             return
-        if any(pp.startswith(key + os.sep) for pp in protected):       # skip folders that have a protected file inside
+        if any(pp.startswith(key + os.sep) for pp in protected):       # skip folders containing a protected file
             return
         owner[key] = group
         found[group].append(p)
@@ -311,7 +311,7 @@ def clean_groups():
     cutoff = time.time() - CLEAN_TEMP_MIN_AGE_HOURS * 3600
     try:
         for e in os.scandir(TMP):
-            if e.name.startswith(("_MEI", "onefile_")):         # Vapor.exe unpacks itself here while it runs
+            if e.name.startswith(("_MEI", "onefile_")):         # a packaged build unpacks itself here while running
                 continue
             try:
                 if e.stat(follow_symlinks=False).st_mtime < cutoff:
@@ -339,12 +339,12 @@ def clean_run(items, progress=None):
     """Deletes the paths, skipping anything locked. Returns (removed, freed_bytes, skipped).
     progress(kind, text) gets called per item so the log window can show it."""
     removed = freed = skipped = 0
-    pause = min(0.03, 1.5 / max(1, len(items)))       # tiny pause so the log window visibly scrolls (1.5 s max in total)
+    pause = min(0.03, 1.5 / max(1, len(items)))       # short pause so the log view scrolls visibly (1.5 s max in total)
     last_label = None
     for p, size in items:
         label = _CLEAN_LABELS.get(p)
         if progress and label and label != last_label:
-            progress("info", "-- %s --" % label)                 # heading when a new group starts
+            progress("info", "-- %s --" % label)                 # heading printed when a new group starts
         last_label = label
         try:
             if os.path.isdir(p):
@@ -430,11 +430,18 @@ def _radio_ps(kind, set_to=None):
     raise RuntimeError("Radio state: " + last)
 
 
+_WINRT_RADIO = [True]      # False once the winrt radio bindings turned out to be missing: PowerShell is used directly after that
+
+
 def radio(kind, set_to=None):
-    try:
-        return asyncio.run(_radio_winrt(kind, set_to))
-    except Exception as ex:  # noqa: BLE001  (winrt missing or failing -> PowerShell)
-        log("winrt radio failed (%s): %r -> PowerShell" % (kind, ex))
+    if _WINRT_RADIO[0]:
+        try:
+            return asyncio.run(_radio_winrt(kind, set_to))
+        except ImportError as ex:
+            _WINRT_RADIO[0] = False
+            log("winrt radio bindings unavailable (%r), using PowerShell" % (ex,))
+        except Exception as ex:  # noqa: BLE001
+            log("winrt radio failed (%s): %r, using PowerShell" % (kind, ex))
     return _radio_ps(kind, set_to)
 
 
@@ -513,7 +520,7 @@ class _Endpoint:
 
     def __init__(self, capture=False):
         ole = ctypes.windll.ole32
-        ole.CoInitializeEx(None, 0)                     # fine if the thread was already initialised
+        ole.CoInitializeEx(None, 0)                     # harmless if the thread is already initialised
         ole.CoCreateInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
                                          ctypes.c_void_p, ctypes.c_void_p]
         ole.CoCreateInstance.restype = ctypes.c_long
@@ -526,7 +533,7 @@ class _Endpoint:
         dev = ctypes.c_void_p()
         hr = _vcall(enum.value, 4, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p)(
             enum.value, 1 if capture else 0, 0, ctypes.byref(dev))   # eCapture / eRender, eConsole
-        self._chk(hr, "GetDefaultAudioEndpoint")          # fails when there's no such device
+        self._chk(hr, "GetDefaultAudioEndpoint")          # fails when no such device exists
         self._ptrs.append(dev.value)
         vol = ctypes.c_void_p()
         hr = _vcall(dev.value, 3, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p)(
@@ -699,7 +706,7 @@ def audio_sessions():
     apps = {}
 
     def see(s):
-        if s["state"] == 2:                                   # expired, the app is gone
+        if s["state"] == 2:                                   # expired: the app has exited
             return
         a = apps.setdefault(s["key"], dict(key=s["key"], name=s["name"], vol=0.0, muted=True, active=False))
         a["vol"] = max(a["vol"], s["level"])
@@ -728,7 +735,7 @@ def _ps(cmd, timeout=20):
 
 def get_brightness():
     try:
-        import screen_brightness_control as sbc          # optional, only used if installed
+        import screen_brightness_control as sbc          # optional, used only when installed
         v = sbc.get_brightness()
         return int(v[0]) if v else None
     except ImportError:
@@ -736,7 +743,7 @@ def get_brightness():
     r = _ps("(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness "
             "| Select-Object -First 1).CurrentBrightness")
     s = (r.stdout or "").strip()
-    return int(s) if s.isdigit() else None               # None = external monitor, no WMI brightness
+    return int(s) if s.isdigit() else None               # None = external monitor, no WMI brightness control
 
 
 def set_brightness(value):
@@ -857,10 +864,10 @@ def _wifi_current(out=None):
     except Exception:  # noqa: BLE001
         _log_once("native wlan query failed:\n" + traceback.format_exc())
     if time.time() - _LAST_CUR["t"] < 4 and st == WLAN_CONNECTED:
-        return _LAST_CUR["v"]                             # the PowerShell lookup takes seconds, reuse a fresh answer if there is one
+        return _LAST_CUR["v"]                             # the PowerShell lookup takes seconds, so a recent answer is reused
     out = _netsh("show", "interfaces") if out is None else out
     if re.search(r"location permission|requires elevation", out, re.I):
-        val = _wifi_ssid_fallback()                       # netsh is blocked, ask the network profile instead
+        val = _wifi_ssid_fallback()                       # netsh is blocked, use the network profile instead
         _LAST_CUR.update(t=time.time(), v=val)
         return val
     cur, state = None, ""
@@ -880,7 +887,7 @@ def _wifi_ssid_fallback():
     """Newer Windows hides the SSID from netsh when Location is off, but the network profile name still works."""
     try:
         r = _ps("(Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -match 'Wi-?Fi|WLAN|Wireless' } "
-                "| Select-Object -First 1).Name", timeout=12)           # one cmdlet is a lot quicker than asking for the adapters too
+                "| Select-Object -First 1).Name", timeout=12)           # a single cmdlet is much faster than also querying the adapters
         name = (r.stdout or "").strip()
         if name:
             return name
@@ -893,7 +900,7 @@ def _wifi_ssid_fallback():
         return None
 
 
-_SCAN_BLOCKED = False      # set once Windows refuses to list networks (Location off), then we show saved ones instead
+_SCAN_BLOCKED = False      # set once Windows refuses to list networks (Location off); saved networks are shown instead
 
 
 def _same_net(cur, ssid):
@@ -903,25 +910,142 @@ def _same_net(cur, ssid):
     return c == n or (c.startswith(n + " ") and c[len(n):].strip().isdigit())
 
 
+_AUTH_NAMES = {1: "Open", 2: "Open", 3: "WPA-Enterprise", 4: "WPA-Personal", 5: "WPA-Personal", 6: "WPA2-Enterprise",
+               7: "WPA2-Personal", 8: "WPA3-Enterprise", 9: "WPA3-Personal", 10: "Open", 11: "WPA3-Enterprise"}
+
+
+def _wlan_scan_native():
+    """Nearby networks straight from the WLAN service: no netsh, so it doesn't care about the Windows language or about
+    netsh's text format. Returns (rc, nets, profiles): rc 0 = fine, 5 = access denied (Location is off), anything else =
+    the service refused. nets is {ssid: {ssid, auth, signal}}, profiles the names of the saved networks."""
+    import ctypes.wintypes as wt
+
+    def go(wlan, h, guid):
+        wlan.WlanScan.argtypes = [wt.HANDLE, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        wlan.WlanGetAvailableNetworkList.argtypes = [wt.HANDLE, ctypes.c_char_p, wt.DWORD, ctypes.c_void_p,
+                                                     ctypes.POINTER(ctypes.c_void_p)]
+        wlan.WlanGetProfileList.argtypes = [wt.HANDLE, ctypes.c_char_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        wlan.WlanFreeMemory.argtypes = [ctypes.c_void_p]
+        wlan.WlanScan(h, guid, None, None, None)           # requests a fresh scan; results arrive shortly afterwards
+        profiles, nets, rc = set(), {}, 0
+        lst = ctypes.c_void_p()
+        if wlan.WlanGetProfileList(h, guid, None, ctypes.byref(lst)) == 0:
+            try:
+                for i in range(ctypes.c_uint32.from_address(lst.value).value):
+                    raw = ctypes.string_at(lst.value + 8 + i * 516, 512)
+                    name = raw.decode("utf-16-le", "ignore").split("\x00")[0]
+                    if name:
+                        profiles.add(name)
+            finally:
+                wlan.WlanFreeMemory(lst)
+        for attempt in range(3):                           # the first answer can be a stale cached list, so ask again after a short wait
+            time.sleep(0.9 if attempt == 0 else 0.7)
+            lst = ctypes.c_void_p()
+            rc = wlan.WlanGetAvailableNetworkList(h, guid, 2, None, ctypes.byref(lst))   # 2 = also hidden networks' profiles
+            if rc != 0:
+                return rc, nets, profiles
+            try:
+                for i in range(ctypes.c_uint32.from_address(lst.value).value):
+                    raw = ctypes.string_at(lst.value + 8 + i * 628, 628)     # WLAN_AVAILABLE_NETWORK is 628 bytes
+                    n = int.from_bytes(raw[512:516], "little")
+                    ssid = raw[516:516 + min(n, 32)].decode("utf-8", "ignore") if n else ""
+                    if not ssid:
+                        continue                           # hidden network, nothing to show
+                    sig = int.from_bytes(raw[604:608], "little")             # 0-100 like netsh's Signal %
+                    auth = _AUTH_NAMES.get(int.from_bytes(raw[612:616], "little"), "WPA2-Personal")
+                    if not int.from_bytes(raw[608:612], "little"):
+                        auth = "Open"
+                    old = nets.get(ssid)
+                    if old is None or sig > old["signal"]:
+                        nets[ssid] = {"ssid": ssid, "auth": auth, "signal": sig}
+            finally:
+                wlan.WlanFreeMemory(lst)
+            if nets:
+                break
+        return 0, nets, profiles
+    res = _wlan_do(go)
+    return res if isinstance(res, tuple) else (res, {}, set())
+
+
+WIFI_HELP = {
+    "location": "Windows is hiding nearby networks. Turn on Settings > Privacy & security > Location > \"Let desktop apps access your location\".",
+    "service": "The Windows WLAN service isn't running. Open Services, find \"WLAN AutoConfig\" and start it.",
+    "noadapter": "Windows doesn't see a Wi-Fi adapter. Check it's enabled in Device Manager and install your laptop maker's Wi-Fi driver.",
+    "empty": "Windows sees no networks. If other devices do, update the Wi-Fi driver from your laptop maker (the generic one often misses networks).",
+    "error": "Couldn't read networks. Check the log at %TEMP%\\vapor_control_center.log.",
+}
+
+
+def open_location_settings():
+    try:
+        os.startfile("ms-settings:privacy-location")
+    except Exception:  # noqa: BLE001
+        log("couldn't open the Location settings:\n" + traceback.format_exc())
+
+
+def _location_prompted():
+    """True if Vapor already opened the Location page for this user, so it only ever does it once on its own."""
+    for d in (os.path.dirname(os.path.abspath(__file__)), TMP):
+        f = os.path.join(d, "vapor_location_prompted")
+        if os.path.exists(f):
+            return True
+    return False
+
+
+def _mark_location_prompted():
+    for d in (os.path.dirname(os.path.abspath(__file__)), TMP):
+        try:
+            open(os.path.join(d, "vapor_location_prompted"), "w").close()
+            return
+        except OSError:
+            continue
+
+
+_SCAN_BLOCKED_T = 0.0      # time of the last "blocked" answer; the scan is retried after 20 s so enabling Location takes effect without a restart
+
+
 def wifi_scan(hint=None):
-    global _SCAN_BLOCKED
-    from concurrent.futures import ThreadPoolExecutor
-    if _SCAN_BLOCKED:                                    # no point calling netsh when we know it gets refused
+    global _SCAN_BLOCKED, _SCAN_BLOCKED_T
+    if _SCAN_BLOCKED and time.time() - _SCAN_BLOCKED_T > 20:
+        _SCAN_BLOCKED = False                            # retry the real scan, Location may have been enabled meanwhile
+    # 1. the native scan (language independent)
+    nrc, nets, nprof = None, {}, set()
+    if not _SCAN_BLOCKED:
+        try:
+            nrc, nets, nprof = _wlan_scan_native()
+            _log_once("native wifi scan rc=%s found=%d" % (nrc, len(nets)))
+        except Exception:  # noqa: BLE001
+            _log_once("native wifi scan failed:\n" + traceback.format_exc())
+            nrc = None
+    # 2. netsh: radio state + saved profiles, and the network list too if the native scan found nothing
+    if _SCAN_BLOCKED:
         prof, ifc, raw = _netsh("show", "profiles"), "", ""
     else:
-        with ThreadPoolExecutor(3) as ex:
-            f_if = ex.submit(_netsh, "show", "interfaces")
-            f_pr = ex.submit(_netsh, "show", "profiles")
-            f_nw = ex.submit(_netsh, "show", "networks", "mode=bssid")
-            ifc, prof, raw = f_if.result(), f_pr.result(), f_nw.result()
+        res = {}
+
+        def _job(key, *args):                            # plain threads instead of ThreadPoolExecutor (lazy imports on Python 3.15 make it uncallable)
+            try:
+                res[key] = _netsh(*args)
+            except Exception:  # noqa: BLE001
+                log("netsh %s failed:\n%s" % (" ".join(args), traceback.format_exc()))
+                res[key] = ""
+        jobs = [("ifc", "show", "interfaces"), ("prof", "show", "profiles")]
+        if not nets:
+            jobs.append(("raw", "show", "networks", "mode=bssid"))
+        threads = [threading.Thread(target=_job, args=j, daemon=True) for j in jobs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        ifc, prof, raw = res.get("ifc", ""), res.get("prof", ""), res.get("raw", "")
     if re.search(r"Software\s+Off|Hardware\s+Off", ifc):
         return {"nets": [], "note": "", "off": True}
     if hint and _wlan_state() == WLAN_CONNECTED:
-        cur = hint                                        # show the last known network right away, it's checked afterwards
+        cur = hint                                        # show the last known network immediately, it is verified afterwards
     else:
         cur = _wifi_current(ifc or None)
-    known = {m.strip() for m in re.findall(r"(?:All User Profile|User Profile)\s*:\s*(.+)", prof)}
-    nets, ssid = {}, None
+    known = {m.strip() for m in re.findall(r"(?:All User Profile|User Profile)\s*:\s*(.+)", prof)} | set(nprof)
+    ssid = None
     for line in raw.splitlines():
         m = re.match(r"\s*SSID\s+\d+\s*:\s*(.*)$", line)
         if m:
@@ -938,13 +1062,22 @@ def wifi_scan(hint=None):
         if m:
             nets[ssid]["signal"] = max(nets[ssid]["signal"], int(m.group(1)))
     note = ""
-    if not nets and (_SCAN_BLOCKED or re.search(r"location|elevation|permission", raw + ifc, re.I)):
+    denied = nrc == 5 or re.search(r"location|elevation|permission", raw + ifc, re.I)
+    if not nets and (_SCAN_BLOCKED or denied):
         if not _SCAN_BLOCKED:
             log("nearby scan blocked by Windows (Location off); using saved networks")
-        _SCAN_BLOCKED = True
+        _SCAN_BLOCKED, _SCAN_BLOCKED_T = True, time.time()
         note = "location"
-        for name in known:                               # can't scan, so list the saved networks
+        for name in known:                               # scanning is blocked, list the saved networks instead
             nets[name] = {"ssid": name, "auth": "WPA2-Personal", "signal": 0}
+    elif not nets:
+        log("wifi scan found nothing (native rc=%s, netsh %d chars)" % (nrc, len(raw)))
+        if nrc == -2:
+            note = "noadapter"                           # no Wi-Fi adapter present (driver missing or adapter disabled)
+        elif nrc == -1:
+            note = "service"                             # the WLAN service (WlanSvc) is not running
+        else:
+            note = "empty"                               # the scan works but no networks are visible: driver, band or range issue
     if cur:
         cur = next((k for k in nets if _same_net(cur, k)), cur)      # map the profile name back to a listed SSID
     if cur and cur not in nets:
@@ -1032,7 +1165,7 @@ def wifi_disconnect():
     while time.time() < deadline:
         st = _wlan_state()
         if st is None:
-            time.sleep(1.0)                              # no state yet, give Windows a moment
+            time.sleep(1.0)                              # no state yet, allow Windows a moment
             return
         if st != WLAN_CONNECTED:
             return
@@ -1105,7 +1238,7 @@ def wifi_connect(ssid, auth, known, password="", hidden=False, keep=False):
         added = True
     _LAST_CUR.update(t=0.0, v=None)
     try:
-        rc = _wlan_connect_native(ssid)                   # netsh won't connect while Location is off, the API does
+        rc = _wlan_connect_native(ssid)                   # netsh refuses to connect while Location is off, the WLAN API does not
     except Exception:  # noqa: BLE001
         log("native connect failed:\n" + traceback.format_exc())
         rc = -1
@@ -1122,15 +1255,15 @@ def wifi_connect(ssid, auth, known, password="", hidden=False, keep=False):
         left, t0 = False, time.time()
         while time.time() - t0 < 14:
             st = _wlan_state()
-            if st is None:                                # no fast state, fall back to the slow lookup
+            if st is None:                                # no fast state available, fall back to the slow lookup
                 time.sleep(1.5)
                 if _same_net(_wifi_current(), ssid):
                     return True, ""
                 continue
             if st != WLAN_CONNECTED:
-                left = True                               # Windows dropped the old link and is joining the new one
+                left = True                               # the old link was dropped and the new one is being joined
             elif left:
-                if added:                                 # new network, make sure Windows didn't fall back to the old one
+                if added:                                 # new network: verify Windows did not fall back to the old one
                     good = False
                     for _ in range(4):
                         _LAST_CUR.update(t=0.0, v=None)
@@ -1141,14 +1274,14 @@ def wifi_connect(ssid, auth, known, password="", hidden=False, keep=False):
                     if not good:
                         break
                 log("connected to %r in %.1fs" % (ssid, time.time() - t0))
-                return True, ""                           # connected again after the switch
-            elif time.time() - t0 > 1.5:                  # never left "connected": already on it, or the request got ignored
+                return True, ""                           # connected again after switching
+            elif time.time() - t0 > 1.5:                  # never left "connected": already on this network, or the request was ignored
                 if _same_net(_wifi_current(), ssid):
                     return True, ""
                 if time.time() - t0 > 6:
                     break
             time.sleep(0.08)
-    if added and not keep:                                # keep a saved network whose password was just re-typed
+    if added and not keep:                                # keep a saved network whose password was just re-entered
         _delete_profile(ssid)
     return False, "Couldn't connect" + (" - check the password" if added and password else "")
 
@@ -1187,12 +1320,16 @@ def _bth():
     return d
 
 
-def bt_list():
+def bt_list(inquiry=False, timeout=4):
+    """Bluetooth devices known to Windows (paired, remembered, connected). With inquiry=True a discovery scan runs
+    first so nearby unpaired devices are included too (timeout is in units of 1.28 s, the call blocks that long).
+    Each entry: {addr, name, connected, paired, cls}."""
     d = _bth()
     sp = _BTH_SEARCH()
     sp.dwSize = ctypes.sizeof(sp)
     sp.fAuth = sp.fRemembered = sp.fConnected = 1
-    sp.fUnknown = sp.fInquiry = 0
+    sp.fUnknown = sp.fInquiry = 1 if inquiry else 0
+    sp.timeout = max(1, min(int(timeout), 48))
     info = _BTH_INFO()
     info.dwSize = ctypes.sizeof(info)
     devs, seen = [], set()
@@ -1202,14 +1339,32 @@ def bt_list():
             while True:
                 if info.Address not in seen:
                     seen.add(info.Address)
-                    devs.append({"addr": int(info.Address), "name": info.szName or "Unknown device",
-                                 "connected": bool(info.fConnected), "cls": int(info.cls)})
+                    paired = bool(info.fAuthenticated or info.fRemembered or info.fConnected)
+                    name = info.szName or ""
+                    if paired or name:                      # unpaired devices without a name are mostly noise
+                        devs.append({"addr": int(info.Address), "name": name or "Unknown device",
+                                     "connected": bool(info.fConnected), "paired": paired, "cls": int(info.cls)})
                 if not d.BluetoothFindNextDevice(h, ctypes.byref(info)):
                     break
         finally:
             d.BluetoothFindDeviceClose(h)
-    devs.sort(key=lambda x: (not x["connected"], x["name"].lower()))
+    devs.sort(key=lambda x: (not x["connected"], not x["paired"], x["name"].lower()))
     return devs
+
+
+def bt_pair(addr):
+    """Pairs with a device (Windows shows its own prompt if a code has to be confirmed). Returns the Win32 result:
+    0 = paired, 259 = already paired, 1223 = cancelled."""
+    d = _bth()
+    d.BluetoothAuthenticateDeviceEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                                wintypes.DWORD]
+    d.BluetoothAuthenticateDeviceEx.restype = wintypes.DWORD
+    info = _BTH_INFO()
+    info.dwSize = ctypes.sizeof(info)
+    info.Address = addr
+    rc = d.BluetoothAuthenticateDeviceEx(None, None, ctypes.byref(info), None, 0)
+    log("bt pair %s -> %s" % (addr, rc))
+    return rc
 
 
 def _bt_services(addr, flag):
@@ -1234,12 +1389,12 @@ def bt_set(addr, connect):
     if not connect:
         _bt_services(addr, 0)
         return
-    _bt_services(addr, 1)                       # works if we disconnected it earlier
+    _bt_services(addr, 1)                       # works if the device was disconnected earlier
     for _ in range(10):
         time.sleep(0.3)
         if any(x["addr"] == addr and x["connected"] for x in bt_list()):
             return
-    _bt_services(addr, 0)                       # device dropped on its own, cycle the services
+    _bt_services(addr, 0)                       # the device dropped on its own, cycle the services
     _bt_services(addr, 1)
 
 
@@ -1379,7 +1534,7 @@ def net_counters():
     try:
         iph = ctypes.windll.iphlpapi
         size = wintypes.ULONG(0)
-        iph.GetIfTable(None, ctypes.byref(size), False)            # first call only tells us the size we need
+        iph.GetIfTable(None, ctypes.byref(size), False)            # the first call only reports the required size
         buf = ctypes.create_string_buffer(size.value)
         if iph.GetIfTable(buf, ctypes.byref(size), False) != 0:
             return {}
@@ -1388,7 +1543,7 @@ def net_counters():
         out = {}
         for i in range(n):
             row = _IFROW.from_buffer_copy(buf, 4 + i * sz)
-            if row.dwType == 24 or row.dwOperStatus not in (4, 5):      # loopback / not connected
+            if row.dwType == 24 or row.dwOperStatus not in (4, 5):      # loopback or not connected
                 continue
             out[row.dwIndex] = (row.dwInOctets, row.dwOutOctets)
         return out
@@ -1518,6 +1673,7 @@ class ControlBackend(QObject):
     wifiNoteChanged = Signal(); wifiNote = Property(str, lambda s: s._v["wifiNote"], notify=wifiNoteChanged)
     wifiBusyChanged = Signal(); wifiBusy = Property("QVariant", lambda s: s._v["wifiBusy"], notify=wifiBusyChanged)
     wifiNotesChanged = Signal(); wifiNotes = Property("QVariant", lambda s: s._v["wifiNotes"], notify=wifiNotesChanged)
+    wifiHelpChanged = Signal(); wifiHelp = Property(str, lambda s: s._v["wifiHelp"], notify=wifiHelpChanged)
     btDevicesChanged = Signal(); btDevices = Property("QVariant", lambda s: s._v["btDevices"], notify=btDevicesChanged)
     btScanningChanged = Signal(); btScanning = Property(bool, lambda s: s._v["btScanning"], notify=btScanningChanged)
     btBusyChanged = Signal(); btBusy = Property("QVariant", lambda s: s._v["btBusy"], notify=btBusyChanged)
@@ -1554,7 +1710,7 @@ class ControlBackend(QObject):
         self._v = dict(
             wifiOn=False, wifiMissing=False, btOn=False, btMissing=False, dndOn=False, darkOn=True, errors={},
             brightness=-1, micVolume=-1, micMuted=False,
-            wifiNets=[], wifiScanning=False, wifiNote="", wifiBusy={}, wifiNotes={},
+            wifiNets=[], wifiScanning=False, wifiNote="", wifiHelp="", wifiBusy={}, wifiNotes={},
             btDevices=[], btScanning=False, btBusy={}, btNotes={}, apps=[], appsState="loading",
             cpu=0.0, memUsed=0.0, memTotal=1.0, netRx=0.0, netTx=0.0, gpu={}, disks=[], uptime="",
             themeState={k: dict(e) for k, e in self._theme.items()},
@@ -1651,7 +1807,7 @@ class ControlBackend(QObject):
 
     # ---- simple toggles ----
     def _toggle(self, key, setter, on):
-        self.put(key + "On", bool(on))                # optimistic, the tile fills up straight away
+        self.put(key + "On", bool(on))                # optimistic update, the tile reflects the change immediately
 
         def work():
             try:
@@ -1665,7 +1821,7 @@ class ControlBackend(QObject):
 
     def _toggled(self, key, wanted, res, err):
         if err:
-            self.put(key + "On", not wanted)           # put it back
+            self.put(key + "On", not wanted)           # revert
             self._set_error(key, err)
             return
         self._set_error(key, "")
@@ -1777,12 +1933,13 @@ class ControlBackend(QObject):
                 data = wifi_scan(hint)
                 self.ui.emit(lambda: self._on_wifi(data))
                 if hint and any(n["connected"] for n in data["nets"]):
-                    real = _wifi_current()              # slow check, just to catch a stale hint
+                    real = _wifi_current()              # slow check that catches a stale hint
                     if real and not _same_net(real, hint):
                         data2 = wifi_scan()
                         self.ui.emit(lambda: self._on_wifi(data2))
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 log("wifi scan failed:\n" + traceback.format_exc())
+                self._wifi_err = "%s: %s" % (type(exc).__name__, str(exc)[:160])
                 self.ui.emit(lambda: self._on_wifi(None))
         self._spawn(work)
 
@@ -1792,13 +1949,19 @@ class ControlBackend(QObject):
         if data is None:
             self.put("wifiNets", [])
             self.put("wifiNote", "error")
+            self.put("wifiHelp", WIFI_HELP["error"] + ("\n" + self._wifi_err if getattr(self, "_wifi_err", "") else ""))
             return
         nets = data["nets"]
         self._wifi_nets = nets
         self._wifi_cur = next((n["ssid"] for n in nets if n["connected"]), None)
         if data.get("off"):
             self.put("wifiOn", False)
-        self.put("wifiNote", data.get("note", ""))
+        note = data.get("note", "")
+        self.put("wifiNote", note)
+        self.put("wifiHelp", WIFI_HELP.get(note, ""))
+        if note == "location" and not _location_prompted():
+            _mark_location_prompted()                    # once per install: open the Location settings page
+            open_location_settings()
         self.put("wifiBusy", {})
         self.put("wifiNets", [dict(n) for n in nets])
 
@@ -1888,7 +2051,7 @@ class ControlBackend(QObject):
         if msg:
             self._wifi_mark("wifiNotes", ssid, msg)
         if ok and _SCAN_BLOCKED:
-            # a full rescan needs the slow SSID lookup here, so use the result we already know
+            # a full rescan needs the slow SSID lookup, so the already known result is used
             target = ssid if connecting else None
             nets = []
             for n in self._wifi_nets:
@@ -1905,30 +2068,42 @@ class ControlBackend(QObject):
     # ---- Bluetooth ----
     @Slot()
     def scanBt(self):
+        if getattr(self, "_bt_scan_busy", False):
+            return
+        self._bt_scan_busy = True
         self.put("btScanning", True)
 
         def work():
             try:
-                devs = bt_list()
+                known = bt_list()                           # instant: paired / remembered / connected devices
+                self.ui.emit(lambda: self._on_bt(known, scanning=True))
+                devs = bt_list(inquiry=True, timeout=4)     # discovery, takes about 5 s
+                log("bt scan: %d known, %d after discovery" % (len(known), len(devs)))
+                if not devs:
+                    devs = known
             except Exception:  # noqa: BLE001
                 log("bt scan failed:\n" + traceback.format_exc())
                 devs = None
             self.ui.emit(lambda: self._on_bt(devs))
         self._spawn(work)
 
-    def _on_bt(self, devs):
-        self.put("btScanning", False)
+    def _on_bt(self, devs, scanning=False):
+        if not scanning:
+            self._bt_scan_busy = False
+        self.put("btScanning", scanning)
         self.put("btBusy", {})
         if devs is None:
             self.put("btDevices", [])
             return
+        self._bt_paired = {str(d["addr"]) for d in devs if d.get("paired", True)}
         self.put("btDevices", [{"addr": str(d["addr"]), "name": d["name"], "connected": d["connected"],
-                                "glyph": bt_icon(d["cls"])} for d in devs])
+                                "paired": d.get("paired", True), "glyph": bt_icon(d["cls"])} for d in devs])
 
     @Slot(str, bool)
     def btSet(self, addr, connect):
         d = dict(self._v["btBusy"])
-        d[addr] = "Connecting..." if connect else "Disconnecting..."
+        needs_pair = connect and addr not in getattr(self, "_bt_paired", {addr})
+        d[addr] = ("Pairing..." if needs_pair else "Connecting...") if connect else "Disconnecting..."
         self.put("btBusy", d)
         n = dict(self._v["btNotes"])
         n.pop(addr, None)
@@ -1937,14 +2112,18 @@ class ControlBackend(QObject):
         def work():
             note = ""
             try:
+                if needs_pair:
+                    rc = bt_pair(int(addr))
+                    if rc not in (0, 259):
+                        raise RuntimeError("pairing failed (%s)" % rc)
                 bt_set(int(addr), connect)
                 devs = bt_list()
                 dv = next((x for x in devs if str(x["addr"]) == addr), None)
                 if not dv or dv["connected"] != connect:
                     note = "Couldn't connect" if connect else "Couldn't disconnect"
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
                 log("bt action failed:\n" + traceback.format_exc())
-                devs, note = None, "Something went wrong"
+                devs, note = None, ("Pairing failed" if "pairing" in str(exc) else "Something went wrong")
 
             def done():
                 if note:
@@ -2003,7 +2182,7 @@ class ControlBackend(QObject):
     # ---- system stats ----
     @Slot()
     def startStats(self):
-        cpu_percent()                                   # prime the delta so the first number shown is real
+        cpu_percent()                                   # prime the delta so the first value shown is valid
         self._net_t = None
         self._ticks = 0
 
@@ -2039,7 +2218,7 @@ class ControlBackend(QObject):
             for k, (i, o) in cur.items():
                 if k in self._net_prev:
                     pi, po = self._net_prev[k]
-                    rx += (i - pi) & 0xFFFFFFFF                # 32-bit counters wrap
+                    rx += (i - pi) & 0xFFFFFFFF                # 32-bit counters wrap around
                     tx += (o - po) & 0xFFFFFFFF
             rx, tx = rx / dt, tx / dt
         self._net_prev, self._net_t = cur, now
@@ -2049,7 +2228,7 @@ class ControlBackend(QObject):
     @Slot(str, str, float, float, float)
     def setTarget(self, target, mode, h, s, v):
         """Theme card. target is shell / outline / icons, mode is "custom" (h, s, v in 0..1, used as is) or "auto"
-        (follow the wallpaper). The bar changes right away, the file is written once you stop dragging."""
+        (follow the wallpaper). The bar updates immediately; the file is written once changes stop."""
         log("setTarget %s %s h=%.3f s=%.3f v=%.3f" % (target, mode, h, s, v))
         if target not in TARGETS:
             return

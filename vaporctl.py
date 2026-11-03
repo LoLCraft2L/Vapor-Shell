@@ -27,7 +27,7 @@ else:
 DATA = Path(os.environ.get("LOCALAPPDATA", str(HERE))) / "vapor"
 CLI_FILE = DATA / "cli.json"
 
-VERSION = "0.1.2"           # keep in step with the release tag (CI can set it from the tag before building vaporctl.exe)
+VERSION = "0.1.3"           # keep in step with the release tag (CI can set it from the tag before building vaporctl.exe)
 REPO = os.environ.get("VAPOR_REPO") or "LoLCraft2L/Vapor-Shell"
 INSTALL_URL = "https://raw.githubusercontent.com/%s/main/scripts/install.ps1" % REPO
 
@@ -61,7 +61,9 @@ HELP = """vaporctl - control the running Vapor shell
   start                       start Vapor (does nothing if it already runs)
   restart | quit | stop       restart or close Vapor  (stop --force kills a hung copy)
 
-  update [--check|--force]    install the latest release (--check only looks, --force reinstalls the same version)
+  update [--check|--force|--extras]   install the latest release; Harmony and Synapse are updated too when installed
+                              (--check only looks, --force reinstalls the same version, --extras asks again which
+                              optional packages to install: Harmony, Synapse)
   --version                   print the installed version
 
   log [N]                     last N lines of vapor.log (default 40)
@@ -670,7 +672,7 @@ def cmd_update(args):
     """update: install the newest release. --check only reports, --force reinstalls even when up to date.
         The real work is done by install.ps1 (same one-liner as the first install, same folder, config.json and files/
         are kept). It runs in its own window and stops this vaporctl.exe, so we start it and leave straight away."""
-    check, force = "--check" in args, "--force" in args
+    check, force, ask = "--check" in args, "--force" in args, "--extras" in args
     tag = latest_release()
     cur, new = _ver(VERSION), _ver(tag)
     newer = (new > cur) if (new and cur) else (tag.lstrip("vV") != VERSION)
@@ -684,9 +686,12 @@ def cmd_update(args):
     import tempfile
     ps = "& ([scriptblock]::Create((irm '%s'))) -Repo '%s' -Dir '%s'; Start-Sleep -Seconds 4" % (
         INSTALL_URL, REPO, str(HERE).replace("'", "''"))
+    if ask:
+        ps = ps.replace("; Start-Sleep", " -AskExtras; Start-Sleep")      # the installer window shows its extra-packages question
     subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
                      cwd=tempfile.gettempdir(),                      # never inside the folder it is about to replace
-                     stdin=subprocess.DEVNULL, close_fds=True, creationflags=0x00000010)      # CREATE_NEW_CONSOLE
+                     stdin=None if ask else subprocess.DEVNULL,       # the question needs the new window's own keyboard
+                     close_fds=True, creationflags=0x00000010)      # CREATE_NEW_CONSOLE
     return "updating v%s -> %s: an installer window opens, Vapor restarts when it is done" % (VERSION, tag.lstrip("vV"))
 
 

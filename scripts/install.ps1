@@ -9,9 +9,12 @@ param(
     [string]$Repo = $(if ($env:VAPOR_REPO) { $env:VAPOR_REPO } else { "LoLCraft2L/Vapor-Shell" }),
     [string]$Dir  = '',
     [switch]$AutoStart,
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    [string[]]$Extras = $null,      # e.g. -Extras Harmony,Synapse : install these optional packages without asking
+    [switch]$NoExtras,              # skip the optional-packages question
+    [switch]$AskExtras              # ask the question even when updating (vaporctl update --extras)
 )
-$VaporVersion = 'v0.1.3'
+$VaporVersion = ''     # not needed any more: the installer shows the version of the release it finds (the git tag)
 $VaporStage   = 'closed beta testing'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -40,7 +43,7 @@ $exe = Join-Path $Dir 'Vapor.exe'
 
 # safety: never wipe a folder that holds other things (the install step clears the folder it installs into)
 if ((Test-Path $Dir) -and -not (Test-Path $exe)) {
-    $other = Get-ChildItem $Dir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin 'config.json', 'files' } | Select-Object -First 1
+    $other = Get-ChildItem $Dir -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin 'config.json', 'files', 'extras' } | Select-Object -First 1
     if ($other) { throw "'$Dir' already has files in it and no Vapor.exe. Use an empty or new folder (-Dir <path>)." }
 }
 
@@ -145,7 +148,69 @@ try {
     }
 } catch { $script:tui = $false }
 
-$AREA = 6                                                   # lines of the live status area
+# ------------------------------------------------------------------ optional extra packages
+# To add another extra, add one line here and attach its zip to the GitHub release:
+#   Id/Name   what the question shows            Desc     short description
+#   Asset     zip file name in the latest release (its files are unpacked into <install>\extras\<Id>)
+#   Exe       file inside that zip to start      Args     start arguments (Startup shortcut + the first start after installing)
+#   MenuArgs  start arguments of the Start menu shortcut      Process   process name to stop before updating
+$ExtraCatalog = @(
+    [pscustomobject]@{ Id = 'Harmony'; Name = 'Harmony'; Desc = 'Wallpaper selector'; Asset = 'Harmony-win64.zip'; Exe = 'Harmony.exe'; Args = '--background'; MenuArgs = '--background'; Process = 'Harmony' }
+    [pscustomobject]@{ Id = 'Synapse'; Name = 'Synapse'; Desc = 'App launcher'; Asset = 'Synapse-win64.zip'; Exe = 'Synapse.exe'; Args = '--hidden'; MenuArgs = ''; Process = 'Synapse' }
+)
+
+function Select-Extras {                                    # returns the Ids the user ticked
+    $n = $ExtraCatalog.Count
+    if ($n -eq 0 -or [Console]::IsInputRedirected) { return @() }
+    if (-not $script:tui) {                                 # no fancy console: plain questions
+        $out = @()
+        Write-Host "Would you also like to install these optional packages?"
+        foreach ($e in $ExtraCatalog) { if ((Read-Host "  Install $($e.Name) ($($e.Desc))? [Y/n]") -notmatch '^n') { $out += $e.Id } }
+        return $out
+    }
+    $sel = New-Object 'bool[]' $n
+    for ($i = 0; $i -lt $n; $i++) { $sel[$i] = $true }      # every package is ticked by default; untick the ones you don't want
+    $pos = 0; $first = $true; $done = $false
+    [Console]::Out.Write("$ESC[?25l`r`n")
+    try {
+        while (-not $done) {
+            $sb = New-Object System.Text.StringBuilder
+            if (-not $first) { [void]$sb.Append("$ESC[$($n + 2)A") }
+            $first = $false
+            [void]$sb.Append("$ESC[2K  $ESC[1;38;2;215;200;245mWould you also like to install these optional packages?$ESC[0m`r`n")
+            for ($i = 0; $i -lt $n; $i++) {
+                $e = $ExtraCatalog[$i]
+                $box = if ($sel[$i]) { '[x]' } else { '[ ]' }
+                $col = if ($i -eq $pos) { '1;38;2;255;255;255' } else { '38;2;170;150;215' }
+                $cur = if ($i -eq $pos) { "$ESC[38;2;192;132;252m>$ESC[0m" } else { ' ' }
+                [void]$sb.Append("$ESC[2K  $cur $ESC[${col}m$box $($e.Name)$ESC[0m  $ESC[38;2;120;100;170m($($e.Desc))$ESC[0m`r`n")
+            }
+            [void]$sb.Append("$ESC[2K  $ESC[38;2;120;100;170mUp/Down move  $([char]0x00B7)  Space ticks or unticks  $([char]0x00B7)  Enter installs$ESC[0m`r`n")
+            [Console]::Out.Write($sb.ToString())
+            switch ([Console]::ReadKey($true).Key.ToString()) {
+                'UpArrow'   { $pos = ($pos + $n - 1) % $n }
+                'DownArrow' { $pos = ($pos + 1) % $n }
+                'Spacebar'  { $sel[$pos] = -not $sel[$pos] }
+                'Enter'     { $done = $true }
+                'Escape'    { $sel = New-Object 'bool[]' $n; $done = $true }
+            }
+        }
+    } finally { [Console]::Out.Write("$ESC[?25h") }
+    $out = @(); for ($i = 0; $i -lt $n; $i++) { if ($sel[$i]) { $out += $ExtraCatalog[$i].Id } }
+    return $out
+}
+
+$chosen = @()
+if (-not $Uninstall -and -not $NoExtras) {
+    if ($PSBoundParameters.ContainsKey('Extras')) { $chosen = @($ExtraCatalog | Where-Object { $Extras -contains $_.Id } | ForEach-Object { $_.Id }) }
+    elseif ((Test-Path $exe) -and -not $AskExtras) {      # an update: refresh the extras that are already installed, don't ask again
+        $chosen = @($ExtraCatalog | Where-Object { Test-Path (Join-Path $Dir "extras\$($_.Id)") } | ForEach-Object { $_.Id })
+    }
+    else { $chosen = @(Select-Extras) }
+}
+$script:extraOn = $chosen.Count -gt 0
+
+$AREA = 6 + [int]$script:extraOn                            # lines of the live status area (one more when extras were picked)
 # pick the biggest logo that fits the window (it must not scroll, or the redraw would smear)
 $LogoText = ''; $ColorText = ''
 if ($script:tui) {
@@ -213,14 +278,16 @@ function Get-Title {
     }
     [void]$sb.Append("$ESC[0m`r`n")
     [void]$sb.Append(' ' * $pad); [void]$sb.Append("$ESC[38;2;120;100;170mfluid shell for Windows$ESC[0m`r`n")
-    [void]$sb.Append(' ' * $pad); [void]$sb.Append("$ESC[38;2;192;132;252m$VaporVersion$ESC[38;2;120;100;170m  $([char]0x00B7)  $VaporStage$ESC[0m`r`n")
+    [void]$sb.Append(' ' * $pad)
+    if ($VaporVersion) { [void]$sb.Append("$ESC[38;2;192;132;252m$VaporVersion$ESC[38;2;120;100;170m  $([char]0x00B7)  $VaporStage$ESC[0m`r`n") }
+    else { [void]$sb.Append("$ESC[38;2;120;100;170m$VaporStage$ESC[0m`r`n") }
     $sb.ToString()
 }
 
 # ------------------------------------------------------------------ live area
 $WAVE = 0x2581..0x2588 | ForEach-Object { [char]$_ }          # the 8 block heights, a wave surface
-$script:stageState = @('pending', 'pending', 'pending', 'pending')
-$script:stageLabel = @('Finding the latest release', 'Downloading', 'Unpacking', 'Installing')
+$script:stageState = @('pending', 'pending', 'pending', 'pending', 'pending')
+$script:stageLabel = @('Finding the latest release', 'Downloading', 'Unpacking', 'Installing', 'Optional packages')
 $script:barFrac = -1.0; $script:barInfo = ''
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $script:lastRender = -1000
@@ -271,6 +338,7 @@ function Render([switch]$Force) {
     if ($script:barFrac -ge 0) { $lines += ("    " + (Get-Bar $script:barFrac $t $barW) + "  $ESC[38;2;190;170;235m" + $script:barInfo + "$ESC[0m") } else { $lines += '' }
     $lines += (Get-StageLine 2 $t)
     $lines += (Get-StageLine 3 $t)
+    if ($script:extraOn) { $lines += (Get-StageLine 4 $t) }
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append("$ESC[${AREA}A")
     foreach ($l in $lines) { [void]$sb.Append("$ESC[2K$l`r`n") }
@@ -306,16 +374,19 @@ function Stop-Vapor {
         try { & $ctl quit | Out-Null; Start-Sleep -Seconds 2 } catch {}
     }
     Get-Process -Name Vapor, vaporctl -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    foreach ($e in $ExtraCatalog) { if ($e.Process) { Get-Process -Name $e.Process -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } }
     Start-Sleep -Milliseconds 500
 }
-function New-Shortcut($path, $target) {
+function New-Shortcut($path, $target, $arguments = '') {
     $s = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
-    $s.TargetPath = $target; $s.WorkingDirectory = Split-Path $target; $s.Save()
+    $s.TargetPath = $target; $s.WorkingDirectory = Split-Path $target
+    if ($arguments) { $s.Arguments = $arguments }
+    $s.Save()
 }
 
 # ------------------------------------------------------------------ intro: the logo flows in
 function Show-Intro {
-    if (-not $script:tui) { Write-Host "Vapor installer $VaporVersion ($VaporStage)"; return }
+    if (-not $script:tui) { Write-Host ("Vapor installer ($VaporStage)"); return }
     [Console]::Out.Write("$ESC[?25l`r`n")
     if ($LogoH -gt 0) {
         $maxD = $LogoW + $LogoH * 2 + 12
@@ -351,6 +422,7 @@ if ($Uninstall) {
         Write-Host "  Removing Vapor ..."
         Stop-Vapor
         Remove-Item $menuLnk, $startLnk -Force -ErrorAction SilentlyContinue
+        foreach ($e in $ExtraCatalog) { Remove-Item (Join-Path $programs "$($e.Name).lnk"), (Join-Path $programs "Startup\$($e.Name).lnk") -Force -ErrorAction SilentlyContinue }
         Remove-Item $Dir -Recurse -Force -ErrorAction SilentlyContinue
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
         $raw = $key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
@@ -368,6 +440,7 @@ if ($Repo -like 'YOUR_*') { throw "Edit install.ps1: set `$Repo to your GitHub '
 $tmp = Join-Path $env:TEMP ("vapor-" + [guid]::NewGuid().ToString('N'))
 $failed = $null
 $tag = ''
+$installedExtras = @(); $extraNotes = @()
 try {
     Show-Intro
     New-Item -ItemType Directory $tmp | Out-Null
@@ -448,7 +521,7 @@ try {
         Get-Process -Name Vapor, vaporctl -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 500
         New-Item -ItemType Directory $Dir -Force | Out-Null
-        Get-ChildItem $Dir -Force | Where-Object { $_.Name -notin 'config.json', 'files' } | Remove-Item -Recurse -Force
+        Get-ChildItem $Dir -Force | Where-Object { $_.Name -notin 'config.json', 'files', 'extras' } | Remove-Item -Recurse -Force
         Get-ChildItem $Src -Force | Where-Object { $_.Name -ne 'files' } | Copy-Item -Destination $Dir -Recurse -Force
         if (Test-Path (Join-Path $Src 'files')) {
             robocopy (Join-Path $Src 'files') (Join-Path $Dir 'files') /E /XC /XN /XO /NFL /NDL /NJH /NJS /NP | Out-Null
@@ -471,6 +544,37 @@ try {
         [void][VaporEnv.Broadcast]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$res)
     } catch {}
     Set-Stage 3 'done' 'Installed'
+
+    # 5  the optional packages that were ticked (kept in <install>\extras\<Id>; updates of Vapor never wipe that folder)
+    if ($script:extraOn) {
+        foreach ($id in $chosen) {
+            $ex = $ExtraCatalog | Where-Object { $_.Id -eq $id } | Select-Object -First 1
+            try {
+                $ea = $rel.assets | Where-Object { $_.name -eq $ex.Asset } | Select-Object -First 1
+                if (-not $ea) { throw "release $tag has no $($ex.Asset)" }
+                Set-Stage 4 'active' "Installing $($ex.Name)"
+                $dest = Join-Path $Dir "extras\$($ex.Id)"
+                Invoke-Busy {
+                    param($url, $zip, $dest, $proc)
+                    $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                    Invoke-WebRequest $url -OutFile $zip -UseBasicParsing -Headers @{ 'User-Agent' = 'vapor-installer' }
+                    if ($proc) { Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }
+                    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+                    New-Item -ItemType Directory $dest -Force | Out-Null
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem
+                    [IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
+                } @($ea.browser_download_url, (Join-Path $tmp $ex.Asset), $dest, $ex.Process)
+                $exExe = Join-Path $dest $ex.Exe
+                New-Shortcut (Join-Path $programs "$($ex.Name).lnk") $exExe $ex.MenuArgs
+                if ($AutoStart) { New-Shortcut (Join-Path $programs "Startup\$($ex.Name).lnk") $exExe $ex.Args }
+                $installedExtras += $ex
+            } catch {
+                $extraNotes += "Couldn't install $($ex.Name): $(Get-Err $_)"      # a failed extra never fails the Vapor install
+            }
+        }
+        Set-Stage 4 'done' 'Optional packages'
+    }
 } catch {
     $failed = Get-Err $_
 } finally {
@@ -489,3 +593,8 @@ Show-Outro
 if ($script:tui) { [Console]::Out.Write("$ESC[?25h") }
 Write-Host "  Vapor $tag is installed in $Dir" -ForegroundColor Green
 Start-Process $exe -WorkingDirectory $Dir
+foreach ($ex in $installedExtras) {
+    Write-Host "  $($ex.Name) is installed in $(Join-Path $Dir "extras\$($ex.Id)")" -ForegroundColor Green
+    Start-Process (Join-Path $Dir "extras\$($ex.Id)\$($ex.Exe)") -ArgumentList $ex.Args -WorkingDirectory (Join-Path $Dir "extras\$($ex.Id)")
+}
+foreach ($n in $extraNotes) { Write-Host "  $n" -ForegroundColor Yellow }

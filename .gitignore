@@ -3,4 +3,5 @@ dist/
 __pycache__/
 *.pyc
 config.json
+cc_theme.json
 .venv/

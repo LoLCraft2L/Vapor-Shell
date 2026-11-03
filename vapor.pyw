@@ -11,7 +11,7 @@ Won't start? run launch_vapor.bat, it shows errors in a console. Startup errors 
 message box and go into the log.
 Log:      %LOCALAPPDATA%\vapor\vapor.log   (QML errors end up here too)
 Flags:    --no-appbar   don't reserve screen space (handy while testing)
-Hotkey:   Alt+W hides / shows the bar with a slide. Change HIDE_HOTKEY below.
+Hotkey:   Alt+W closes the shell
 """
 
 import asyncio
@@ -38,8 +38,8 @@ import winreg
 from ctypes import wintypes
 from pathlib import Path
 
-# logging + the error dialog have to come before the Qt imports, otherwise a broken PySide6 dies
-# silently when started with pythonw
+# logging and the error dialog are set up before the Qt imports, otherwise a broken PySide6 install
+# fails silently when started with pythonw
 FROZEN = bool(getattr(sys, "frozen", False))      # True when running as the PyInstaller Vapor.exe
 if FROZEN:
     HERE = Path(getattr(sys, "_MEIPASS", "") or Path(sys.executable).resolve().parent)   # bundled files: Vapor.qml, cc_backend ...
@@ -96,8 +96,8 @@ except Exception:
 # ---- settings ----
 PILL_H = 36              # bar height, keep in sync with barH in Vapor.qml
 RESERVE_H = 36           # screen space the app bar reserves at the top
-CLAMP_MAXIMIZED = True    # without komorebi: keep maximized windows inside the glass frame ourselves (works even if Windows ignores the app bars)
-# padding like YASB's `padding: {top, left, bottom, right}`, only used when komorebi is offline (logical px). It's added
+CLAMP_MAXIMIZED = True    # without komorebi: keep maximized windows inside the glass frame (also works when Windows ignores app bars)
+# per-edge padding {top, left, bottom, right} in logical px, used only when komorebi is offline. It is added
 # on top of the bar / frame to get the space the app bars reserve, so maximize + snap keep that gap.
 # with komorebi online this is ignored, it uses RESERVE_H / FRAME_W through global-work-area-offset.
 OFFLINE_PAD = {"top": 1, "left": 0, "right": 0, "bottom": 0}
@@ -110,12 +110,12 @@ RESERVE_FRAME = True     # also reserve the side + bottom frame so apps don't po
 FRAME_W = 8              # frame thickness in logical px, keep in sync with frameW in Vapor.qml
 USE_APPBAR = "--no-appbar" not in sys.argv
 STRIP_H = RESERVE_H + 20               # main window height in logical px: the bar plus the rounded inner corners (popups get their own window)
-HIDE_HOTKEY = "alt+w"    # global hotkey to hide / show the bar, like "ctrl+alt+b" or "win+f2", "" turns it off
+HIDE_HOTKEY = "alt+w"    # global hotkey to close
 HIDE_RELEASES_SPACE = True   # give the reserved space back while hidden
 HIDE_ON_FULLSCREEN = True
 HIDE_ON_SNIP = True      # hide the bar while the Snipping Tool / Win+Shift+S capture overlay is up (otherwise it stays on top of the dimmed screen)
 SNIP_EXES = ("screenclippinghost.exe", "snippingtool.exe")   # programs that draw the capture overlay
-CONTROL_CENTER = str(APPDIR / "control_center.exe") if FROZEN else str(HERE / "control_center.pyw")   # old stand-alone control center next to this file, only used by B.openControlCenter
+CONTROL_CENTER = str(APPDIR / "control_center.exe") if FROZEN else str(HERE / "control_center.pyw")   # legacy stand-alone control center next to this file, used only by B.openControlCenter
 KOMOREBI_MONITOR = 0     # which komorebi monitor the workspace dots follow
 AUTO_SWITCH_OUTPUT = True  # make a playback device the default as soon as it shows up (headphones, Bluetooth, USB DAC ...)
 VIZ_RANGE_DB = 38.0     # how many dB under the loudest band still show (lower = more contrast, higher = flatter)
@@ -127,6 +127,10 @@ VIZ_FALL = 0.82         # how fast the bars fall each frame (0.7 = snappy, 0.9 =
 WIFI_POLL_S = 60         # backup re-check of the network name, every check starts a PowerShell process. normally it's re-checked as soon as Windows reports a change
 PHONES_POLL_S = 2        # how often the playback devices' registry fingerprint is checked (cheap, no process). the PowerShell scan only runs when it changes
 TRIM_MEMORY = True       # every 2 min hand unused memory pages back to Windows, so Task Manager shows the real working set
+PEEK_ENABLED = True      # hover-peek: a live preview of the hovered window on a screen-sized dark backdrop. that backdrop is the biggest
+                         # window Vapor ever shows (about 33 MB of surface at 4K, which dwm.exe has to hold), so False is the biggest single
+                         # DWM saving. the app cards in the bar still work, they just don't preview the window any more
+DWM_AUDIT = True         # write one line per Vapor window (size, visible, estimated DWM surface) to the log 6 s and 60 s after start
 VIZ_ENABLED = True       # audio visualizer (pip install numpy pyaudiowpatch)
 TRAY_ENABLED = True      # system tray, reads Explorer's notification-area icons (pinned ones sit right of the visualizer)
 APP_NOTIFICATIONS = True   # show other apps' Windows notifications (Discord, Chrome, mail ...) in Vapor's own card at the top
@@ -184,8 +188,11 @@ SKIP_CLASSES = {
     "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
     "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow",
 }
+UAC_CLASS = "Credential Dialog Xaml Host"      # the "Do you want to allow this app to make changes" prompt (consent.exe)
 EnumProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 _exe_cache = {}
+_exe_miss = {}          # pid -> time of the last failed lookup (retried after 2 s, so a failure is never stuck)
+_skip_logged = set()
 
 
 def pid_of(hwnd):
@@ -197,6 +204,8 @@ def pid_of(hwnd):
 def exe_of(pid):
     if pid in _exe_cache:
         return _exe_cache[pid]
+    if time.time() - _exe_miss.get(pid, 0.0) < 2.0:
+        return ""
     if len(_exe_cache) > 800:
         _exe_cache.clear()
     path = ""
@@ -207,8 +216,37 @@ def exe_of(pid):
         if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
             path = buf.value
         kernel32.CloseHandle(h)
-    _exe_cache[pid] = path
+    if not path:
+        path = _exe_from_snapshot(pid)
+    if path:
+        _exe_cache[pid] = path
+        _exe_miss.pop(pid, None)
+    else:
+        _exe_miss[pid] = time.time()
     return path
+
+
+def _exe_from_snapshot(pid):
+    """SYSTEM / protected programs (the UAC prompt, consent.exe) refuse OpenProcess, but the process snapshot still
+        names them. Returns the System32 path when that file exists, else the bare exe name."""
+    for _ in range(2):
+        for name, p in running_processes():
+            if p == pid:
+                full = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", name)
+                return full if os.path.exists(full) else name
+        _procs["t"] = 0.0           # not in the cached list (a brand-new process): re-read it once
+    return ""
+
+
+def _log_unlisted(hwnd, pid):
+    """One log line per kind of window the bar can't list, so `vaporctl log` shows what is being skipped."""
+    key = (class_of(hwnd), pid)
+    if key in _skip_logged or len(_skip_logged) > 200:
+        return
+    _skip_logged.add(key)
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetWindowTextW(hwnd, buf, 256)
+    log.info("window not listed (its program can't be read): class=%s pid=%d title=%r", key[0], pid, buf.value)
 
 
 def class_of(hwnd):
@@ -252,7 +290,7 @@ def running_processes():
 
 
 # Firefox-family browsers (Zen, Firefox ...) hand Windows a hash like 308046B0AF4A39CB as their app id, which
-# the media widget used to show as the app name. these are the programs we look for instead.
+# would otherwise be shown as the app name in the media widget. these programs are matched instead.
 BROWSER_NAMES = {"zen.exe": "Zen", "firefox.exe": "Firefox", "librewolf.exe": "LibreWolf", "waterfox.exe": "Waterfox",
                  "floorp.exe": "Floorp", "mullvadbrowser.exe": "Mullvad Browser", "tor.exe": "Tor Browser"}
 
@@ -325,6 +363,7 @@ def list_windows(own_pid):
                 return True
             exe = exe_of(pid)
             if not exe:
+                _log_unlisted(hwnd, pid)
                 return True
             uwp, hicon = False, 0
             if os.path.basename(exe).lower() == "applicationframehost.exe":
@@ -334,7 +373,8 @@ def list_windows(own_pid):
                     hicon = window_hicon(hwnd)
             buf = ctypes.create_unicode_buffer(512)
             user32.GetWindowTextW(hwnd, buf, 512)
-            out.append({"hwnd": int(hwnd), "exe": exe, "title": buf.value, "uwp": uwp, "hicon": hicon})
+            uac = class_of(hwnd) == UAC_CLASS or os.path.basename(exe).lower() == "consent.exe"
+            out.append({"hwnd": int(hwnd), "exe": exe, "title": buf.value, "uwp": uwp, "hicon": hicon, "uac": uac})
         except Exception:
             pass
         return True
@@ -621,26 +661,26 @@ def wallpaper_colors(src):
         oh, os_ = h, s
     # a wallpaper with real colour gets a strongly saturated outline, a grey one stays grey (no hue to boost)
     o_sat = min(OUTLINE_MAX_SAT, max(os_ * 0.9, 0.4)) if os_ >= 0.12 else os_
-    # the fill used to get brighter with the wallpaper (value 0.10 .. 0.24), so bright wallpapers gave a lighter shell.
-    # now it's capped, so every wallpaper gets the same dark shell, only the hue / saturation follow the wallpaper
+    # the fill brightness is capped instead of scaling with the wallpaper (value 0.10 .. 0.24),
+    # so every wallpaper gets the same dark shell and only hue / saturation follow the wallpaper
     fill_v = min((0.12 + 0.18 * v) * FILL_DARKNESS, FILL_MAX_V)
     return argb(1.0, h, min(0.85, s * 1.1), fill_v), argb(1.0, oh, o_sat, 1.0)
 
 
-HINT_FILE = DATA / "wallpaper_next.txt"     # Harmony writes the new wallpaper's path here as soon as a change starts
+HINT_FILE = DATA / "wallpaper_next.txt"     # the wallpaper picker (Harmony) writes the new wallpaper's path here as soon as a change starts
 
 
 def glass_loop(b):
     transcoded = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Themes/TranscodedWallpaper"
     last = None
     try:
-        hint_sig = HINT_FILE.stat().st_mtime_ns          # whatever is there from an earlier session is old news
+        hint_sig = HINT_FILE.stat().st_mtime_ns          # a value left over from an earlier session is stale
     except OSError:
         hint_sig = None
     hinted_until, tick = 0.0, 0
     while True:
         try:
-            # 1) Harmony says which wallpaper is coming, recolour right away so the bar changes with the transition
+            # 1) the wallpaper picker announces the incoming wallpaper: recolour immediately so the bar changes with the transition
             try:
                 st = HINT_FILE.stat().st_mtime_ns
             except OSError:
@@ -660,9 +700,9 @@ def glass_loop(b):
                 sig = (src, os.path.getmtime(src) if os.path.exists(src) else 0,
                        os.path.getmtime(transcoded) if transcoded.exists() else 0)
                 if sig != last and os.path.exists(src) and time.time() >= hinted_until:
-                    # only mark it done once we've really coloured from it. before, a change seen during the 8 s
-                    # after a hint was dropped for good, so the hint's colours stayed until the next restart, and
-                    # a restart (which colours from Windows' copy) then looked "way different"
+                    # only mark it done once the colours were really taken from it. otherwise a change seen during the 8 s
+                    # after a hint was dropped would be lost for good, leaving the hint's colours in place until the next restart,
+                    # and a restart (which colours from Windows' copy) would then look noticeably different
                     last = sig
                     fill, outline = wallpaper_colors(src)
                     log.info("colours from windows wallpaper %s: fill %s outline %s", src, fill, outline)
@@ -757,7 +797,7 @@ _komo_live = threading.Event()          # set while the event pipe is connected 
 
 def _komo_pipe_loop(b):
     """Event-driven komorebi. We own a named pipe and ask komorebi (`komorebic subscribe-pipe`) to write to it.
-        Every event carries the full state, so the workspace dots follow the moment you switch (no 0.45 s polling,
+        Every event carries the full state, so the workspace dots follow the moment the workspace switches (no 0.45 s polling,
         no komorebic process per tick). If komorebi stops or restarts the pipe breaks and we subscribe again."""
     k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.CreateNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
@@ -873,9 +913,17 @@ def komorebi_loop(b):
 def tasks_loop(b):
     own = os.getpid()
     last_fg, last_fs, last_sig = 0, None, None
+    seen_uac = set()
     while True:
         try:
             wins, fg = list_windows(own)
+            now_uac = {w["hwnd"] for w in wins if w.get("uac")}
+            for h in now_uac - seen_uac:        # a new UAC prompt: bring it to the front so it isn't left flashing
+                try:
+                    activate_window(h)
+                except Exception:
+                    log.exception("uac prompt")
+            seen_uac = now_uac
             sig = (tuple((w["hwnd"], w["title"]) for w in wins), fg)
             if sig != last_sig:
                 last_sig = sig
@@ -897,10 +945,18 @@ def tasks_loop(b):
 
 NET_PS = (
     "$ErrorActionPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+    # the kind (wifi / ethernet) comes from .NET, not Get-NetAdapter: no WMI needed, and PhysicalMediaType is often 'Unspecified'
+    "$nics = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object { $_.OperationalStatus -eq 'Up' }); "
+    "function Kind($n) { if ($n.NetworkInterfaceType -eq 'Wireless80211') { '802.11' } "
+    "elseif ($n.NetworkInterfaceType -in 'Ethernet','GigabitEthernet','FastEthernetT') { '802.3' } else { 'other' } } "
+    "$seen = 0; "
     "foreach ($p in Get-NetConnectionProfile) { "
     "if ($p.IPv4Connectivity -eq 'Disconnected' -and $p.IPv6Connectivity -eq 'Disconnected') { continue }; "
-    "$a = Get-NetAdapter -InterfaceIndex $p.InterfaceIndex; "
-    "$p.Name + '|' + $a.PhysicalMediaType }"
+    "$n = $nics | Where-Object { $_.Name -eq $p.InterfaceAlias } | Select-Object -First 1; "
+    "$k = if ($n) { Kind $n } else { [string](Get-NetAdapter -InterfaceIndex $p.InterfaceIndex).PhysicalMediaType }; "
+    "$seen++; $p.Name + '|' + $k }; "
+    # no connection profiles at all (Windows' network service / WMI broken): fall back to the wifi adapter itself
+    "if (-not $seen) { foreach ($n in $nics) { if ($n.NetworkInterfaceType -eq 'Wireless80211' -and $n.GetIPProperties().GatewayAddresses.Count) { $n.Name + '|802.11' } } }"
 )
 
 
@@ -920,8 +976,12 @@ def _net_change_watcher(ev):
 def _net_scan():
     best = ("", False, "")
     rank = {"wifi": 0, "ethernet": 1, "other": 2}
-    for line in run_hidden(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", NET_PS],
-                           timeout=15).splitlines():
+    r = subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", NET_PS],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=40, creationflags=CNW)     # a cold PowerShell at login can take 15 s+
+    out = r.stdout.decode("utf-8", errors="ignore")
+    if not out.strip():                      # log the reason when no network is shown on the bar
+        log.warning("network scan returned nothing (exit %s) %s", r.returncode, r.stderr.decode("utf-8", errors="ignore").strip()[:300])
+    for line in out.splitlines():
         name, _, media = line.strip().partition("|")
         if not name:
             continue
@@ -949,6 +1009,7 @@ def wifi_loop(b):
     last = b._settings.get("lastNet") or {}
     if last.get("name"):             # the network from last time shows right away, the scan below confirms or fixes it
         b.wifiIn.emit((last["name"], True, last.get("kind") or "wifi"))
+    misses = 0
     while True:
         best, ok = ("", False, ""), False
         try:
@@ -958,7 +1019,8 @@ def wifi_loop(b):
         b.wifiIn.emit(best)
         if ok:
             _cache_put(b, "lastNet", {"name": best[0], "kind": best[2]} if best[1] else {})
-        ev.wait(WIFI_POLL_S)
+        misses = 0 if (ok and best[1]) else misses + 1
+        ev.wait(5.0 if 0 < misses <= 6 else WIFI_POLL_S)      # nothing found / scan failed: look again in 5 s (6 times), then every minute
         if ev.is_set():
             time.sleep(2.0)                      # let the new connection settle before asking
         ev.clear()
@@ -1074,8 +1136,8 @@ def uptime_str():
     return "up " + ", ".join(parts)
 
 
-CONFIG_FILE = APPDIR / "config.json"          # next to vapor.pyw: your name + profile picture
-FILES = APPDIR / "files"                      # your own files: ringtone.mp3, profile picture
+CONFIG_FILE = APPDIR / "config.json"          # next to vapor.pyw: user name + profile picture
+FILES = APPDIR / "files"                      # user files: ringtone.mp3, profile picture
 try:
     FILES.mkdir(exist_ok=True)
 except OSError:
@@ -1114,7 +1176,7 @@ def load_config():
 def ensure_cli_shim():
     """Typing `vaporctl` in a terminal only finds vaporctl.exe / .cmd / .bat: a bare vaporctl.py is not on PATHEXT, so
         having the folder on Path isn't enough. If the folder only has vaporctl.py this writes a small vaporctl.cmd
-        next to it that runs it with this Python. A vaporctl.cmd you made yourself is never touched."""
+        next to it that runs it with this Python. A user-made vaporctl.cmd is never touched."""
     if FROZEN:
         return                                                  # the packaged build ships vaporctl.exe
     src = APPDIR / "vaporctl.py"
@@ -1139,7 +1201,7 @@ def ensure_cli_shim():
 
 
 def ensure_on_path():
-    """Keeps this folder on your user Path (HKCU, no admin) so `vaporctl` works from any terminal. If the folder moved,
+    """Keeps this folder on the user Path (HKCU, no admin) so `vaporctl` works from any terminal. If the folder moved,
         the entry Vapor added earlier gets replaced. Terminals that were already open need reopening to see it.
         Turn it off with "addToPath": false in config.json."""
     if not load_config()["addToPath"]:
@@ -1180,7 +1242,7 @@ def ensure_on_path():
 
 
 def _avatar_source():
-    """Profile picture: config.json's "profilePicture" if that file exists, otherwise the picture set for your Windows
+    """Profile picture: config.json's "profilePicture" if that file exists, otherwise the picture set for the Windows
         account (Settings > Accounts > Your info), or "" if there's none."""
     custom = load_config()["profilePicture"]
     if custom:
@@ -1546,7 +1608,7 @@ class MediaWorker(threading.Thread):
 
                 This only changes which app the widget shows and the control buttons talk to, it never starts, pauses or
                 skips anything. The Windows bindings have no way to move their 'current session', so the choice is kept
-                here: `pick` pins the widget to that app until you scroll again or its session ends (then it goes back to
+                here: `pick` pins the widget to that app until the next scroll or until its session ends (then it goes back to
                 following the current session).
                 """
         loop, mgr = self.loop, self.mgr
@@ -2132,7 +2194,7 @@ if QQuickImageProvider is not None:
 
 # The peek is Vapor's own: a dark screen-sized window (Vapor.qml "Vapor Peek") sits under the bar and frame, and the
 # hovered window is drawn into it as a live DWM thumbnail at its real position. Windows' built-in peek hides every
-# window it doesn't know about, including your bar and borders, so it can't be used here.
+# window it doesn't know about, including the bar and borders, so it can't be used here.
 _dwm = ctypes.WinDLL("dwmapi")
 _dwm.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(ctypes.c_void_p)]
 _dwm.DwmUpdateThumbnailProperties.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -2143,6 +2205,60 @@ _dwm.DwmQueryThumbnailSourceSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(win
 class _DWM_THUMB(ctypes.Structure):
     _fields_ = [("dwFlags", wintypes.DWORD), ("rcDestination", wintypes.RECT), ("rcSource", wintypes.RECT),
                 ("opacity", ctypes.c_ubyte), ("fVisible", wintypes.BOOL), ("fSourceClientAreaOnly", wintypes.BOOL)]
+
+
+_dwm.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+_dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+DWMWA_TRANSITIONS_FORCEDISABLED = 3
+# every window title Vapor.qml creates (the power menu isn't listed, its title isn't known here)
+VAPOR_WINDOW_TITLES = ("Vapor", "Vapor Popup", "Vapor L", "Vapor R", "Vapor B", "Vapor Peek",
+                       "Vapor Dock", "Vapor Side Panel", "Vapor Alarm")
+
+
+def dwm_slim(hwnd):
+    """Turns off DWM's own show / hide / minimize animations for one of our windows. For those animations dwm.exe
+        takes a snapshot bitmap of the window, which for a screen-sized window is a lot of memory, and a bar that
+        slides itself in QML doesn't need them. True if Windows accepted it."""
+    val = wintypes.BOOL(1)
+    return _dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), DWMWA_TRANSITIONS_FORCEDISABLED,
+                                      ctypes.byref(val), ctypes.sizeof(val)) == 0
+
+
+def dwm_audit():
+    """One line per top-level window of this process, biggest first: visible / hidden, size in device pixels, the
+        extended style flags and what one buffer of it costs. dwm.exe keeps at least that much per visible window, so
+        this shows which of Vapor's windows is the expensive one.
+        flags: L = layered, T = click-through, N = no redirection bitmap, X = always on top"""
+    own = os.getpid()
+    rows = []
+
+    @EnumProc
+    def cb(hwnd, _lp):
+        try:
+            if pid_of(hwnd) != own:
+                return True
+            r = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(r))
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(hwnd, buf, 256)
+            rows.append((bool(user32.IsWindowVisible(hwnd)), r.right - r.left, r.bottom - r.top,
+                         user32.GetWindowLongW(hwnd, GWL_EXSTYLE), class_of(hwnd), buf.value))
+        except Exception:
+            pass
+        return True
+
+    user32.EnumWindows(cb, 0)
+    lines, total = [], 0.0
+    for vis, w, h, ex, cls, title in sorted(rows, key=lambda x: -(x[1] * x[2])):
+        if w <= 0 or h <= 0:
+            continue
+        mb = w * h * 4 / 1048576.0
+        if vis:
+            total += mb
+        flags = "".join(c for c, bit in (("L", 0x80000), ("T", 0x20), ("N", 0x200000), ("X", 0x8)) if ex & bit)
+        lines.append("%-7s %5dx%-5d %7.1f MB  %-4s %s '%s'" % ("visible" if vis else "hidden", w, h, mb, flags or "-", cls, title))
+    lines.append("visible windows add up to about %.1f MB for a single buffer each" % total)
+    return "\n".join(lines)
 
 
 def tray_icon_url(hicon):
@@ -2616,6 +2732,11 @@ class Backend(QObject):
         self._cc_open = False          # control center open? (the click-outside watcher only runs then)
         self._rgn_warned = False
         self._out_seen = None          # output devices seen so far (id -> scans in a row it was missing)
+        self._peek_gen = 0             # bumped on every peek start / stop, so a timer from an older hover can't do anything
+        self._peeking = False
+        self._peek_thumb = 0
+        self._peek_target = 0
+        self._slim_done = set()        # windows that already got DWM's animations switched off
 
         self.tasksIn.connect(self._on_tasks)
         self.komoIn.connect(self._on_komo)
@@ -2647,6 +2768,11 @@ class Backend(QObject):
         self._battery_t = QTimer(self); self._battery_t.timeout.connect(self._poll_battery); self._battery_t.start(5000)
         self._volume_t = QTimer(self); self._volume_t.timeout.connect(self._poll_volume); self._volume_t.start(750)
         self._top_t = QTimer(self); self._top_t.timeout.connect(self._keep_on_top); self._top_t.start(200)
+        self._slim_t = QTimer(self); self._slim_t.timeout.connect(self._slim_windows); self._slim_t.start(5000)
+        QTimer.singleShot(1500, self._slim_windows)
+        if DWM_AUDIT:
+            QTimer.singleShot(6000, lambda: log.info("dwm audit (6 s after start):\n%s", dwm_audit()))
+            QTimer.singleShot(60000, lambda: log.info("dwm audit (60 s after start):\n%s", dwm_audit()))
         self._poll_battery()
         self._clock_t = QTimer(self)
         self._clock_t.setTimerType(Qt.TimerType.PreciseTimer)
@@ -2898,6 +3024,8 @@ class Backend(QObject):
         if cmd in ("note", "note-rm", "remind-rm"):
             self.cliCommand.emit(cmd, args[0])
             return "ok"
+        if cmd == "dwm":                                     # the window / DWM surface table
+            return dwm_audit()
         if cmd == "restart":
             if FROZEN:      # sys.executable is Vapor.exe itself so it can't run "-c" code: wait 3 s with PowerShell, then start it again
                 exe = str(Path(sys.executable).resolve()).replace("'", "''")
@@ -3008,7 +3136,7 @@ class Backend(QObject):
             should_reserve = bool(on and not (self._v["userHidden"] and HIDE_RELEASES_SPACE))
 
             # when hiding / exiting with komorebi online, remove the live offset this shell owns.
-            # that also clears a stale offset left by older Vapor versions
+            # that also clears a stale offset left by an earlier run
             if self._v["komoOnline"] and not should_reserve:
                 if self._komo_off != (0, 0, 0, 0):
                     spawn(["komorebic", "global-work-area-offset", "0", "0", "0", "0"])
@@ -3036,9 +3164,9 @@ class Backend(QObject):
             if want_frame and not self._edges:
                 thick = round(FRAME_W * self.dpr)
                 if self._v["komoOnline"]:
-                    sizes = {0: thick, 2: thick, 3: thick}          # online: exactly as before
+                    sizes = {0: thick, 2: thick, 3: thick}          # online: standard reservation
                 else:
-                    il, _it, ir, ib = self._offline_insets()        # offline: frame + YASB-style padding
+                    il, _it, ir, ib = self._offline_insets()        # offline: frame + configurable padding
                     sizes = {0: il, 2: ir, 3: ib}
                 for title, edge in (("Vapor L", 0), ("Vapor R", 2), ("Vapor B", 3)):
                     eh = find_win_hwnd(title)
@@ -3366,7 +3494,7 @@ class Backend(QObject):
                 if w.title() in ("Vapor", "Vapor Popup", "Vapor L", "Vapor R", "Vapor B"):
                     wins[w.title()] = int(w.winId())
             own = set(wins.values())
-            for title in ("Synapse Shell", "Synapse Shell L", "Synapse Shell R"):    # Synapse's >shell card + its two flares
+            for title in ("Synapse Shell", "Synapse Shell L", "Synapse Shell R"):    # the launcher's shell card + its two flares
                 hw = user32.FindWindowW(None, title)
                 if hw:
                     own.add(hw)
@@ -3405,6 +3533,23 @@ class Backend(QObject):
     def raiseOnTop(self):
         """Can be called from QML (e.g. when a popup opens or is hovered): put the bar and popup on top right now."""
         self._keep_on_top(True)
+
+    def _slim_windows(self):
+        """Switch off DWM's show / hide animations (and the snapshot surfaces they need) for every Vapor window. Windows
+                are looked up by title instead of through Qt, so asking never forces a hidden QML window to be created."""
+        try:
+            self._slim_done = {h for h in self._slim_done if user32.IsWindow(h)}
+            for title in VAPOR_WINDOW_TITLES:
+                hw = user32.FindWindowW(None, title)
+                if hw and int(hw) not in self._slim_done and dwm_slim(int(hw)):
+                    self._slim_done.add(int(hw))
+        except Exception:
+            log.exception("dwm slim")
+
+    @Slot(result=str)
+    def dwmAudit(self):
+        """For QML / debugging: the same table the log gets, one line per window of this process."""
+        return dwm_audit()
 
     @Slot(bool)
     def setControlOpen(self, on):
@@ -3886,16 +4031,20 @@ class Backend(QObject):
     @Slot(str)
     def peekStart(self, hwnd_s):
         try:
+            if not PEEK_ENABLED:
+                return
             target = int(hwnd_s)
             if not user32.IsWindow(target):
                 return
             self._peek_drop()                                  # moving between cards: swap the picture, keep the backdrop
+            self._peek_gen += 1
+            gen = self._peek_gen
             self._peek_target = target
             was = getattr(self, "_peeking", False)
             self._peeking = True
             if not was:
                 self.peekOverlay.emit(True)                    # QML shows the backdrop window
-            QTimer.singleShot(0 if was else 70, lambda: self._peek_go(target))   # a new window needs a moment to exist
+            QTimer.singleShot(0 if was else 70, lambda: self._peek_go(target, gen))   # a new window needs a moment to exist
         except Exception:
             log.exception("peek start")
 
@@ -3908,7 +4057,9 @@ class Backend(QObject):
             except Exception:
                 log.exception("peek: unregister")
 
-    def _peek_go(self, target):
+    def _peek_go(self, target, gen=None):
+        if gen is not None and gen != self._peek_gen:
+            return                                             # a newer hover (or a stop) replaced this one
         if not getattr(self, "_peeking", False) or getattr(self, "_peek_target", 0) != target:
             return                                             # the mouse already left
         try:
@@ -3929,6 +4080,7 @@ class Backend(QObject):
             # backdrop over every normal window, then the bar goes back on top of it (its popup is owned by it and follows)
             user32.SetWindowPos(wintypes.HWND(ov), wintypes.HWND(-1), m.left, m.top, mw, mh, 0x0010 | 0x0040)   # NOACTIVATE | SHOWWINDOW
             user32.SetWindowPos(wintypes.HWND(bar), wintypes.HWND(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)   # NOSIZE | NOMOVE | NOACTIVATE
+            self._peek_drop()                                  # never leave an earlier registration behind, dwm.exe keeps those until the window dies
             th = ctypes.c_void_p()
             hr = _dwm.DwmRegisterThumbnail(wintypes.HWND(ov), wintypes.HWND(target), ctypes.byref(th))
             if hr != 0 or not th.value:
@@ -3961,10 +4113,25 @@ class Backend(QObject):
 
     @Slot()
     def peekStop(self):
+        self._peek_gen += 1                                    # any peek timer still waiting is now void
         self._peek_drop()
         if getattr(self, "_peeking", False):
             self._peeking = False
             self.peekOverlay.emit(False)
+            QTimer.singleShot(700, self._peek_backdrop_check)
+
+    def _peek_backdrop_check(self):
+        """The screen-sized backdrop should be gone once the peek ended. If QML only faded it out and left the window
+                'visible', dwm.exe keeps a screen-sized surface for it for as long as the bar runs, so hide it for real.
+                The next peek shows it again (_peek_go uses SWP_SHOWWINDOW)."""
+        try:
+            if self._peeking:
+                return
+            ov = user32.FindWindowW(None, "Vapor Peek")
+            if ov and user32.IsWindowVisible(ov):
+                user32.ShowWindow(ov, 0)                       # SW_HIDE
+        except Exception:
+            log.exception("peek backdrop check")
 
     @Slot(str)
     def peekActivate(self, hwnd_s):
@@ -4068,7 +4235,7 @@ CLI_FILE = DATA / "cli.json"
 
 
 def start_cli_server(b):
-    """Local command channel for vaporctl.py: 127.0.0.1 only, random port + token kept in cli.json (in your own
+    """Local command channel for vaporctl.py: 127.0.0.1 only, random port + token kept in cli.json (in the user's
         AppData folder), one JSON line in and one out. Commands run on the Qt main thread."""
     token = secrets.token_hex(16)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -4212,7 +4379,7 @@ def notif_loop(b):
                 continue
             top, rows = _notif_read(db, last if last is not None else 2 ** 62)
             last_sig = sig
-            if last is None:                       # first read: everything already there is old news
+            if last is None:                       # first read: existing entries are treated as already seen
                 last = top
             else:
                 for nid, payload, pid in rows:
@@ -4291,6 +4458,10 @@ def main():
 
     qInstallMessageHandler(qt_log)
     log.info("starting (python %s, appbar=%s)", sys.version.split()[0], USE_APPBAR)
+    # always render with Qt Quick's software (CPU) renderer. the default GPU path draws the glass frame's outline wrong on
+    # some Windows / driver setups (only the top edge shows). forced on purpose, and it has to be set before the
+    # QGuiApplication exists.
+    os.environ["QT_QUICK_BACKEND"] = "software"
     app = QGuiApplication(sys.argv)
     # crisp text: draw every Text with the OS rasteriser (hinted glyphs) instead of Qt Quick's scalable distance-field
     # glyphs, which look soft at fractional scaling like 125 %
