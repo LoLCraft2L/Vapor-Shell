@@ -61,9 +61,10 @@ HELP = """vaporctl - control the running Vapor shell
   start                       start Vapor (does nothing if it already runs)
   restart | quit | stop       restart or close Vapor  (stop --force kills a hung copy)
 
-  update [--check|--force|--extras]   install the latest release; Harmony and Synapse are updated too when installed
-                              (--check only looks, --force reinstalls the same version, --extras asks again which
-                              optional packages to install: Harmony, Synapse)
+  update [--check|--force|--extras|--no-extras]   install the latest release; Harmony and Synapse are updated too when
+                              installed, and you are asked about the ones you don't have yet (--check only looks,
+                              --force reinstalls the same version, --extras asks about all optional packages even when
+                              up to date, --no-extras skips the question)
   --version                   print the installed version
 
   log [N]                     last N lines of vapor.log (default 40)
@@ -672,15 +673,18 @@ def cmd_update(args):
     """update: install the newest release. --check only reports, --force reinstalls even when up to date.
         The real work is done by install.ps1 (same one-liner as the first install, same folder, config.json and files/
         are kept). It runs in its own window and stops this vaporctl.exe, so we start it and leave straight away."""
-    check, force, ask = "--check" in args, "--force" in args, "--extras" in args
+    check, force, explicit = "--check" in args, "--force" in args, "--extras" in args
+    skip = "--no-extras" in args
+    missing = [n for n in ("Harmony", "Synapse") if not (HERE / "extras" / n).is_dir()]      # optional packages not installed yet
+    ask = (explicit or bool(missing)) and not skip      # the installer window then shows its extra-packages question
     tag = latest_release()
     cur, new = _ver(VERSION), _ver(tag)
     newer = (new > cur) if (new and cur) else (tag.lstrip("vV") != VERSION)
     line = "installed v%s, latest %s" % (VERSION, tag)
     if check:
         return line + ("   update available: run  vaporctl update" if newer else "   (up to date)")
-    if not newer and not force:
-        return "already up to date (v%s)" % VERSION
+    if not newer and not force and not (explicit and not skip):
+        return "already up to date (v%s)%s" % (VERSION, ("   (optional packages not installed: %s - run  vaporctl update --extras)" % ", ".join(missing)) if missing else "")
     if not FROZEN:
         raise RuntimeError("running from source, so there is no install to replace (latest is %s): update with git pull" % tag)
     import tempfile
@@ -688,6 +692,8 @@ def cmd_update(args):
         INSTALL_URL, REPO, str(HERE).replace("'", "''"))
     if ask:
         ps = ps.replace("; Start-Sleep", " -AskExtras; Start-Sleep")      # the installer window shows its extra-packages question
+    elif skip:
+        ps = ps.replace("; Start-Sleep", " -NoExtras; Start-Sleep")
     subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
                      cwd=tempfile.gettempdir(),                      # never inside the folder it is about to replace
                      stdin=None if ask else subprocess.DEVNULL,       # the question needs the new window's own keyboard

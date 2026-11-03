@@ -1,5 +1,7 @@
 # Vapor installer / updater / uninstaller (terminal UI).
 #   Install or update:  irm https://raw.githubusercontent.com/LoLCraft2L/Vapor-Shell/main/scripts/install.ps1 | iex
+# The default command asks which optional packages (Harmony, Synapse) to install - no extra command needed.
+#   On an update it refreshes the packages you already have and asks about the ones you don't have yet.
 # Options (needs the script-block form):
 #   & ([scriptblock]::Create((irm <that url>))) -AutoStart      start Vapor at every login
 #   & ([scriptblock]::Create((irm <that url>))) -Dir D:\Apps\Vapor   install somewhere else
@@ -159,13 +161,13 @@ $ExtraCatalog = @(
     [pscustomobject]@{ Id = 'Synapse'; Name = 'Synapse'; Desc = 'App launcher'; Asset = 'Synapse-win64.zip'; Exe = 'Synapse.exe'; Args = '--hidden'; MenuArgs = ''; Process = 'Synapse' }
 )
 
-function Select-Extras {                                    # returns the Ids the user ticked
-    $n = $ExtraCatalog.Count
+function Select-Extras($Catalog) {                          # returns the Ids the user ticked (from the given list of packages)
+    $n = @($Catalog).Count
     if ($n -eq 0 -or [Console]::IsInputRedirected) { return @() }
     if (-not $script:tui) {                                 # no fancy console: plain questions
         $out = @()
         Write-Host "Would you also like to install these optional packages?"
-        foreach ($e in $ExtraCatalog) { if ((Read-Host "  Install $($e.Name) ($($e.Desc))? [Y/n]") -notmatch '^n') { $out += $e.Id } }
+        foreach ($e in $Catalog) { if ((Read-Host "  Install $($e.Name) ($($e.Desc))? [Y/n]") -notmatch '^n') { $out += $e.Id } }
         return $out
     }
     $sel = New-Object 'bool[]' $n
@@ -179,7 +181,7 @@ function Select-Extras {                                    # returns the Ids th
             $first = $false
             [void]$sb.Append("$ESC[2K  $ESC[1;38;2;215;200;245mWould you also like to install these optional packages?$ESC[0m`r`n")
             for ($i = 0; $i -lt $n; $i++) {
-                $e = $ExtraCatalog[$i]
+                $e = $Catalog[$i]
                 $box = if ($sel[$i]) { '[x]' } else { '[ ]' }
                 $col = if ($i -eq $pos) { '1;38;2;255;255;255' } else { '38;2;170;150;215' }
                 $cur = if ($i -eq $pos) { "$ESC[38;2;192;132;252m>$ESC[0m" } else { ' ' }
@@ -187,7 +189,9 @@ function Select-Extras {                                    # returns the Ids th
             }
             [void]$sb.Append("$ESC[2K  $ESC[38;2;120;100;170mUp/Down move  $([char]0x00B7)  Space ticks or unticks  $([char]0x00B7)  Enter installs$ESC[0m`r`n")
             [Console]::Out.Write($sb.ToString())
-            switch ([Console]::ReadKey($true).Key.ToString()) {
+            $key = ''
+            try { $key = [Console]::ReadKey($true).Key.ToString() } catch { $key = 'Enter' }
+            switch ($key) {
                 'UpArrow'   { $pos = ($pos + $n - 1) % $n }
                 'DownArrow' { $pos = ($pos + 1) % $n }
                 'Spacebar'  { $sel[$pos] = -not $sel[$pos] }
@@ -196,17 +200,20 @@ function Select-Extras {                                    # returns the Ids th
             }
         }
     } finally { [Console]::Out.Write("$ESC[?25h") }
-    $out = @(); for ($i = 0; $i -lt $n; $i++) { if ($sel[$i]) { $out += $ExtraCatalog[$i].Id } }
+    $out = @(); for ($i = 0; $i -lt $n; $i++) { if ($sel[$i]) { $out += $Catalog[$i].Id } }
     return $out
 }
 
 $chosen = @()
 if (-not $Uninstall -and -not $NoExtras) {
     if ($PSBoundParameters.ContainsKey('Extras')) { $chosen = @($ExtraCatalog | Where-Object { $Extras -contains $_.Id } | ForEach-Object { $_.Id }) }
-    elseif ((Test-Path $exe) -and -not $AskExtras) {      # an update: refresh the extras that are already installed, don't ask again
-        $chosen = @($ExtraCatalog | Where-Object { Test-Path (Join-Path $Dir "extras\$($_.Id)") } | ForEach-Object { $_.Id })
+    elseif ((Test-Path $exe) -and -not $AskExtras) {      # an update: refresh the extras that are already installed, and ask about the ones that are not installed yet
+        $have    = @($ExtraCatalog | Where-Object { Test-Path (Join-Path $Dir "extras\$($_.Id)") } | ForEach-Object { $_.Id })
+        $missing = @($ExtraCatalog | Where-Object { $have -notcontains $_.Id })
+        $picked  = @(); if ($missing.Count -gt 0) { $picked = @(Select-Extras $missing) }
+        $chosen  = @($have + $picked)
     }
-    else { $chosen = @(Select-Extras) }
+    else { $chosen = @(Select-Extras $ExtraCatalog) }
 }
 $script:extraOn = $chosen.Count -gt 0
 

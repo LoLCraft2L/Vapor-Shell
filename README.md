@@ -82,13 +82,13 @@ cd D:\Apps
 irm https://raw.githubusercontent.com/LoLCraft2L/Vapor-Shell/main/scripts/install.ps1 | iex
 ```
 
-It downloads the latest release, installs it into `D:\Apps\Vapor` (or wherever you were), adds a Start Menu shortcut and starts Vapor. On a first install it also asks whether you want [Harmony and Synapse](#harmony-and-synapse).
+It downloads the latest release, installs it into `D:\Apps\Vapor` (or wherever you were), adds a Start Menu shortcut and starts Vapor. It then asks which optional packages you want, [Harmony and Synapse](#harmony-and-synapse). Both are ticked by default: use Up/Down to move, Space to untick one and Enter to install. You don't need a second command for them.
 
 Want it to start when you log in? Run `vaporctl autostart on` once Vapor is installed.
 
 ### Choose the extras without being asked
 
-Add `-Extras Harmony,Synapse` to install them without the question, or `-NoExtras` to skip it:
+The installer asks by default. Add `-Extras Harmony,Synapse` to install them without the question, or `-NoExtras` to skip it:
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/LoLCraft2L/Vapor-Shell/main/scripts/install.ps1))) -Extras Harmony,Synapse
@@ -110,7 +110,13 @@ The installer refuses a folder that already has other files in it and no `Vapor.
 vaporctl update
 ```
 
-That installs the newest release and leaves your `config.json` and `files` folder alone. Harmony and Synapse get updated too if you have them installed. Use `vaporctl update --check` if you only want to see whether something new is out.
+That installs the newest release and leaves your `config.json` and `files` folder alone.
+
+- Harmony and Synapse get updated too if you have them installed, without asking.
+- If one of them isn't installed yet, an installer window opens and asks if you want it. Add `--no-extras` to skip that question.
+- `vaporctl update --check` only tells you whether something new is out.
+- `vaporctl update --extras` asks about all the optional packages, even when you're already on the latest version.
+- `vaporctl update --force` reinstalls the current version, which also refreshes Harmony and Synapse.
 
 ### Uninstall
 
@@ -152,8 +158,9 @@ vaporctl doctor       # checks your install, config and log for problems
 | `vaporctl restart` | Restart it |
 | `vaporctl quit` | Close it (`stop` does the same, and `stop --force` kills a hung copy) |
 | `vaporctl autostart on` / `off` | Start Vapor at every login |
-| `vaporctl update` | Install the latest release (`--check` only looks, `--force` reinstalls the same version) |
-| `vaporctl update --extras --force` | Asks again which optional packages to install (Harmony, Synapse). `--force` is needed when you're already on the latest version |
+| `vaporctl update` | Install the latest release. Updates Harmony and Synapse if you have them, and asks about the ones you don't (`--check` only looks, `--force` reinstalls the same version) |
+| `vaporctl update --extras` | Asks which optional packages to install (Harmony, Synapse), even when you're already on the latest version |
+| `vaporctl update --no-extras` | Updates without asking about optional packages |
 | `vaporctl uninstall` | Remove Vapor (your logs and settings are kept) |
 | `vaporctl hide` / `show` / `toggle` | Slide the bar away or bring it back |
 | `vaporctl reload` | Re-read `config.json` without restarting |
@@ -249,7 +256,7 @@ Two apps made to go with Vapor have been released. I designed both of them.
 - **Harmony** is my wallpaper selector.
 - **Synapse** is an app launcher with commands that can control Vapor. It uses Everything for file search, so make sure you have [Everything](https://www.voidtools.com/) installed.
 
-They're optional. The installer asks if you want them the first time you install Vapor. They live in the `extras` folder inside your Vapor folder, so updating Vapor never wipes them. A normal `vaporctl update` keeps them up to date once they're installed, and `vaporctl update --extras --force` asks again which ones you want.
+They're optional. The installer asks if you want them when you install Vapor, and `vaporctl update` asks again about any you don't have yet (`--no-extras` skips the question). They live in the `extras` folder inside your Vapor folder, so updating Vapor never wipes them. Once they're installed, a normal `vaporctl update` keeps them up to date, and `vaporctl update --extras` asks about them again.
 
 <details>
   <summary><b>Preview</b></summary>
@@ -285,7 +292,7 @@ Errors go to `%LOCALAPPDATA%\vapor\vapor.log`, and QML errors end up there as we
 .\scripts\build.ps1
 ```
 
-That makes `dist\Vapor\Vapor.exe` and `dist\Vapor-win64.zip`. To publish a version, create a GitHub release with a tag like `v0.1.0` and attach `Vapor-win64.zip`. The install command always grabs the newest published release, so don't mark it as a pre-release or the installer won't find it.
+That makes `dist\Vapor\Vapor.exe` and `dist\Vapor-win64.zip`, plus `dist\Harmony-win64.zip` and `dist\Synapse-win64.zip` when `Harmony.pyw` and `Synapse.pyw` are in the repo root. To publish a version, create a GitHub release with a tag like `v0.1.0` and attach all three zips. The installer looks for those exact file names, and an optional package whose zip is missing from the release can't be installed. The install command always grabs the newest published release, so don't mark it as a pre-release or the installer won't find it.
 
 ## Known problems
 
